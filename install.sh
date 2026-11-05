@@ -15,6 +15,7 @@ fi
 mkdir -p "$APP_DIR" "$(dirname "$DESKTOP")"
 install -m 755 "$DIR/cmf_buds.py" "$APP_DIR/cmf_buds.py"
 install -m 644 "$DIR/buds_codecs.py" "$APP_DIR/buds_codecs.py"
+install -m 644 "$DIR/buds_eq.py" "$APP_DIR/buds_eq.py"
 ICON_DIR="$HOME/.local/share/icons/hicolor"
 install -Dm 644 "$DIR/icons/buds.png" "$ICON_DIR/512x512/apps/io.github.ytarmen.CmfBuds.png"
 install -Dm 644 "$DIR/icons/buds-128.png" "$ICON_DIR/128x128/apps/io.github.ytarmen.CmfBuds.png"

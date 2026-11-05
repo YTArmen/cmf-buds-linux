@@ -25,6 +25,7 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from buds_codecs import CODECS  # noqa: E402
+import buds_eq  # noqa: E402
 
 
 # --- поиск наушников -------------------------------------------------------
@@ -357,6 +358,8 @@ class DevicePage(Gtk.Box):
     def on_state(self, ok):
         self.set_controls_sensitive(ok)
         self.banner.set_revealed(not ok)
+        if getattr(self, "eqg", None):
+            self.eqg.connected(ok)
         if ok:
             self.read_all()
         else:
@@ -365,6 +368,153 @@ class DevicePage(Gtk.Box):
 
     def read_all(self):
         pass
+
+
+EQ_CONF_DIR = os.path.join(GLib.get_user_runtime_dir(), "cmf-buds-eq")
+EQ_CSS = b"""
+.eq-band scale trough { min-width: 6px; border-radius: 3px; }
+.eq-band scale highlight { border-radius: 3px; background: #E8845C; }
+.eq-band scale slider { min-width: 18px; min-height: 18px; background: #E8845C; border: none;
+  box-shadow: 0 1px 3px alpha(black, .35); transition: transform 150ms cubic-bezier(.23,1,.32,1); }
+.eq-band scale:hover slider { transform: scale(1.15); }
+.eq-value { font-feature-settings: "tnum"; font-size: 11px; }
+.eq-freq { font-size: 11px; opacity: .6; }
+"""
+
+
+class EqGroup:
+    """Раздел «Эквалайзер»: включатель, готовые наборы и 10 ползунков. Настройки — на каждые наушники."""
+
+    def __init__(self, page, mac, title, cfg_get, cfg_set):
+        self.eq = buds_eq.Equalizer(mac, title, EQ_CONF_DIR)
+        self.cfg_get, self.cfg_set = cfg_get, cfg_set
+        saved = cfg_get() or {}
+        self.gains = list(saved.get("gains") or [0] * 10)
+        self.busy = False
+        self.pending = None
+
+        prov = Gtk.CssProvider()
+        prov.load_from_data(EQ_CSS)
+        Gtk.StyleContext.add_provider_for_display(page.get_display(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        g = Adw.PreferencesGroup(title="Эквалайзер",
+                                 description="Звук настраивается на компьютере перед отправкой в наушники")
+        self.switch = Adw.SwitchRow(title="Включить эквалайзер")
+        g.add(self.switch)
+        self.preset = Adw.ComboRow(title="Набор", model=Gtk.StringList.new([n for _, n, _ in buds_eq.PRESETS]))
+        g.add(self.preset)
+
+        box = Gtk.Box(spacing=2, homogeneous=True, margin_top=10, margin_bottom=6, margin_start=6, margin_end=6)
+        self.scales, self.values = [], []
+        for i, lab in enumerate(buds_eq.LABELS):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["eq-band"])
+            val = Gtk.Label(label="0", css_classes=["eq-value"])
+            sc = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, inverted=True, draw_value=False,
+                           height_request=150, adjustment=Gtk.Adjustment(lower=-12, upper=12, step_increment=1,
+                                                                        page_increment=3))
+            sc.connect("value-changed", self.on_scale, i)
+            col.append(val)
+            col.append(sc)
+            col.append(Gtk.Label(label=lab, css_classes=["eq-freq"]))
+            box.append(col)
+            self.scales.append(sc)
+            self.values.append(val)
+        self.bands = Adw.PreferencesRow(activatable=False, child=box)
+        g.add(self.bands)
+        self.status = Adw.ActionRow(title="", visible=False, css_classes=["dim-label"])
+        g.add(self.status)
+        page.page.add(g)
+
+        names = [k for k, _, _ in buds_eq.PRESETS]
+        self.preset.set_selected(names.index(saved.get("preset", "flat")) if saved.get("preset") in names else 0)
+        self._show(self.gains)
+        self.switch.connect("notify::active", self.on_switch)
+        self.preset.connect("notify::selected", self.on_preset)
+        self.switch.set_active(bool(saved.get("on")))
+        self.bands.set_sensitive(self.switch.get_active())
+
+    def _show(self, gains):
+        self.busy = True
+        for sc, val, gn in zip(self.scales, self.values, gains):
+            sc.set_value(gn)
+            val.set_label(f"{gn:+.0f}" if gn else "0")
+        self.busy = False
+
+    def _save(self):
+        names = [k for k, _, _ in buds_eq.PRESETS]
+        self.cfg_set({"on": self.switch.get_active(), "preset": names[self.preset.get_selected()],
+                      "gains": self.gains})
+
+    def _say(self, text):
+        self.status.set_title(text or "")
+        self.status.set_visible(bool(text))
+
+    def on_switch(self, *_):
+        on = self.switch.get_active()
+        self.bands.set_sensitive(on)
+        self._save()
+        if on:
+            err = self.eq.start(self.gains)
+            if err:
+                self._say(err)
+                self.busy = True
+                self.switch.set_active(False)
+                self.busy = False
+                self.bands.set_sensitive(False)
+                self._save()
+            else:
+                self._say("")
+        else:
+            self.eq.stop()
+
+    def on_preset(self, *_):
+        gains = buds_eq.PRESETS[self.preset.get_selected()][2]
+        if gains is None:  # «Свой» — оставить как есть
+            self._save()
+            return
+        self.gains = list(gains)
+        self._show(self.gains)
+        self._apply()
+
+    def on_scale(self, sc, i):
+        if self.busy:
+            return
+        v = round(sc.get_value())
+        self.gains[i] = v
+        self.values[i].set_label(f"{v:+d}" if v else "0")
+        custom = len(buds_eq.PRESETS) - 1
+        if self.preset.get_selected() != custom:
+            self.busy = True
+            self.preset.set_selected(custom)
+            self.busy = False
+        self._apply()
+
+    def _apply(self):
+        # не чаще раза в 60 мс — ползунок шлёт много событий
+        if self.pending is None:
+            self.pending = GLib.timeout_add(60, self._flush)
+
+    def _flush(self):
+        self.pending = None
+        self._save()
+        gains = list(self.gains)
+        threading.Thread(target=self.eq.set_gains, args=(gains,), daemon=True).start()
+        return False
+
+    def connected(self, ok):
+        """Наушники подключились или пропали: эквалайзер включается и выключается вместе с ними."""
+        if not self.switch.get_active():
+            return
+        if ok and not self.eq.running:
+            def later():
+                err = self.eq.start(self.gains)
+                GLib.idle_add(self._say, err)
+            threading.Timer(2.0, later).start()  # дать системе поднять звук
+        elif not ok and self.eq.running:
+            self.eq.stop()
+
+    def shutdown(self):
+        self.eq.stop()
 
 
 class CmfPage(DevicePage):
@@ -561,6 +711,8 @@ class AirPodsPage(DevicePage):
                                        active=True)
         g.add(self.autopause)
         page.add(g)
+
+        self.eqg = EqGroup(self, mac, model, *eq_store(mac))
 
         g = Adw.PreferencesGroup(title="Об устройстве")
         g.add(Adw.ActionRow(title="Модель", subtitle=model))
@@ -813,6 +965,7 @@ class ProfilePage(DevicePage):
         self.ear_row = Adw.ActionRow(title="Сейчас", subtitle="—")
         g.add(self.ear_row)
         self.page.add(g)
+        self.eqg = EqGroup(self, mac, name, *eq_store(mac))
         g = Adw.PreferencesGroup(title="Об устройстве")
         g.add(Adw.ActionRow(title="Название", subtitle=name))
         g.add(Adw.ActionRow(title="Профиль", subtitle=f"{profile.get('name', profile['id'])}, версия {profile.get('version', 1)}"))
@@ -888,6 +1041,7 @@ class GenericPage(DevicePage):
         self.name, self.remote_url = name, None
         self.on_profile = None  # окно подставит: что делать после скачивания
         threading.Thread(target=self._look_up, daemon=True).start()
+        self.eqg = EqGroup(self, mac, name, *eq_store(mac))
         g = Adw.PreferencesGroup(title="Об устройстве")
         g.add(Adw.ActionRow(title="Название", subtitle=name))
         g.add(Adw.ActionRow(title="Адрес Bluetooth", subtitle=mac))
@@ -954,6 +1108,9 @@ class GenericPage(DevicePage):
         return True
 
     def show(self, on, pct):
+        if on != getattr(self, "_was_on", None):
+            self._was_on = on
+            self.eqg.connected(on)
         self.banner.set_revealed(not on)
         self.banner.set_title(self.WAIT_TEXT)
         if pct is None:
@@ -967,6 +1124,18 @@ class GenericPage(DevicePage):
 
 # --- окно ------------------------------------------------------------------
 CONFIG = os.path.join(GLib.get_user_config_dir(), "cmf-buds", "settings.json")
+
+
+def eq_store(mac):
+    """Чтение и запись настроек эквалайзера этих наушников в settings.json."""
+    def get():
+        return load_config().get("eq", {}).get(mac)
+
+    def put(value):
+        cfg = load_config()
+        cfg.setdefault("eq", {})[mac] = value
+        save_config(cfg)
+    return get, put
 
 
 def load_config():
@@ -1084,6 +1253,12 @@ class Window(Adw.ApplicationWindow):
         self.cfg["hidden"] = sorted(self.hidden)
         save_config(self.cfg)
         self.apply_visibility()
+
+    def do_close_request(self):
+        for _, page in getattr(self, "pages", {}).values():
+            if getattr(page, "eqg", None):
+                page.eqg.shutdown()
+        return False
 
     def on_refresh(self, *_):
         page = self.stack.get_visible_child()
