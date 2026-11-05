@@ -71,9 +71,26 @@ def set_default(name):
         subprocess.run(["wpctl", "set-default", str(i)], capture_output=True, timeout=5)
 
 
+def get_volume(name):
+    i = node_id(name)
+    if i is None:
+        return None
+    try:
+        out = subprocess.run(["wpctl", "get-volume", str(i)], capture_output=True, text=True, timeout=5).stdout
+        return float(out.split()[1])  # «Volume: 0.45»
+    except (OSError, IndexError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def set_volume(name, vol):
+    i = node_id(name)
+    if i is not None and vol is not None:
+        subprocess.run(["wpctl", "set-volume", str(i), f"{vol:.3f}"], capture_output=True, timeout=5)
+
+
 def preamp(gains):
-    """Чтобы не было хрипа при подъёме полос, общий уровень снижаем на самый большой подъём."""
-    return 10 ** (-max(0, max(gains)) / 20)
+    """Чтобы не было хрипа при подъёме полос, общий уровень чуть снижаем (на половину самого большого подъёма)."""
+    return 10 ** (-max(0, max(gains)) / 2 / 20)
 
 
 class Equalizer:
@@ -83,6 +100,7 @@ class Equalizer:
         self.proc = None
         self.prev_default = None
         self.node = None
+        self.target = None
 
     @property
     def running(self):
@@ -150,6 +168,12 @@ context.modules = [
         if self.node is None:
             self.stop()
             return "Не удалось запустить эквалайзер (PipeWire)."
+        # громкость: эквалайзер забирает её себе, а наушники — на 100 %,
+        # иначе кнопки громкости упрутся в прежний уровень наушников
+        self.target = target
+        vol = get_volume(target)
+        set_volume(self.name, vol if vol is not None else 0.5)
+        set_volume(target, 1.0)
         set_default(self.name)
         return None
 
@@ -164,6 +188,10 @@ context.modules = [
                        capture_output=True, timeout=5)
 
     def stop(self):
+        if self.running and self.target:
+            vol = get_volume(self.name)  # вернуть наушникам ту громкость, что была у эквалайзера
+            if vol is not None:
+                set_volume(self.target, vol)
         if self.proc:
             self.proc.terminate()
             try:
