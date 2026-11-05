@@ -71,7 +71,19 @@ def find_devices():
             if "AIRPODS" in model.upper() or "AIRPODS" in name.upper():
                 AIRPODS_MODEL_OF[mac] = model
                 found.append(("airpods", mac, name))  # на вкладке — имя из Bluetooth
+                continue
+        # любые другие наушники и гарнитуры — хотя бы заряд (стандарт Bluetooth)
+        if any(f"Icon: {i}" in info for i in ("audio-headset", "audio-headphones")):
+            found.append(("generic", mac, name))
     return found
+
+
+def bt_battery(mac):
+    """Общий заряд по стандарту Bluetooth (BlueZ Battery1), если наушники его сообщают."""
+    for ln in _bt("info", mac).splitlines():
+        if "Battery Percentage:" in ln and "(" in ln:
+            return int(ln.rsplit("(", 1)[1].rstrip(")"))
+    return None
 
 
 def is_connected(mac):
@@ -627,6 +639,63 @@ class AirPodsPage(DevicePage):
             self.link.set_control(ctl, 1 if row.get_active() else 2)
 
 
+class GenericPage(DevicePage):
+    """Наушники без своего профиля: общий заряд из Bluetooth."""
+
+    WAIT_TEXT = "Наушники не подключены. Подключите их — заряд появится сам."
+
+    def __init__(self, mac, name):
+        super().__init__(mac)
+        g = Adw.PreferencesGroup(title="Заряд")
+        self.row = Adw.ActionRow(title="Наушники", subtitle="—")
+        self.bar = Gtk.LevelBar(min_value=0, max_value=100, hexpand=True,
+                                valign=Gtk.Align.CENTER, width_request=140)
+        self.row.add_suffix(self.bar)
+        g.add(self.row)
+        self.page.add(g)
+        g = Adw.PreferencesGroup(
+            title="Управление",
+            description="Для этих наушников пока нет профиля, поэтому видно только общий заряд. "
+                        "Профили разных марок добавляются в программу по мере готовности.")
+        self.page.add(g)
+        g = Adw.PreferencesGroup(title="Об устройстве")
+        g.add(Adw.ActionRow(title="Название", subtitle=name))
+        g.add(Adw.ActionRow(title="Адрес Bluetooth", subtitle=mac))
+        self.page.add(g)
+        self.link = self  # для окна: set_enabled
+        self.enabled = True
+        self.read_all()
+        GLib.timeout_add_seconds(30, self.read_all)
+
+    def set_enabled(self, on):
+        self.enabled = on
+
+    def set_controls_sensitive(self, ok):
+        pass
+
+    def read_all(self):
+        if not self.enabled:
+            return True
+
+        def work():
+            on = is_connected(self.mac)
+            pct = bt_battery(self.mac) if on else None
+            GLib.idle_add(self.show, on, pct)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def show(self, on, pct):
+        self.banner.set_revealed(not on)
+        self.banner.set_title(self.WAIT_TEXT)
+        if pct is None:
+            self.row.set_subtitle("наушники не сообщают заряд" if on else "—")
+            self.bar.set_value(0)
+        else:
+            self.row.set_subtitle(f"{pct}%")
+            self.bar.set_value(pct)
+        return False
+
+
 # --- окно ------------------------------------------------------------------
 CONFIG = os.path.join(GLib.get_user_config_dir(), "cmf-buds", "settings.json")
 
@@ -675,6 +744,9 @@ class Window(Adw.ApplicationWindow):
         for kind, mac, name in self.devices:
             if kind == "cmf":
                 page = CmfPage(mac)
+                icon = "audio-headphones-symbolic"
+            elif kind == "generic":
+                page = GenericPage(mac, name)
                 icon = "audio-headphones-symbolic"
             else:
                 page = AirPodsPage(mac, AIRPODS_MODEL_OF.get(mac, name))
