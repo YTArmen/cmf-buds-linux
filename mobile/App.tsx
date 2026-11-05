@@ -9,7 +9,7 @@ import BudsBt, { BondedDevice } from './modules/buds-bt/src/BudsBtModule';
 import { AirPodsInfo, parseAdv } from './src/airpods';
 import * as cmf from './src/cmf';
 import { Changes, CODECS, Noise, Profile, ProfileModel } from './src/codecs';
-import { download, findLocal, findRemote, IndexEntry } from './src/profiles';
+import { findProfile } from './src/profiles';
 import { saveBattery } from './src/store';
 import { Banner, BatteryCell, C, Card, fadeSwap, Segmented } from './src/ui';
 import Animated from 'react-native-reanimated';
@@ -362,37 +362,17 @@ function ProfileScreen({ dev, profile, model }: { dev: BondedDevice; profile: Pr
   );
 }
 
-/** Наушники без профиля: ищем поддержку на GitHub и предлагаем скачать. */
-function UnknownScreen({ dev, onProfile }: { dev: BondedDevice; onProfile: () => void }) {
-  const [entry, setEntry] = useState<IndexEntry | null | undefined>(undefined);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string>();
-  useEffect(() => {
-    findRemote(dev.name).then(setEntry).catch(() => setErr('Нет связи с GitHub'));
-  }, [dev.name]);
+/** Наушники, для которых в приложении нет профиля. */
+function OtherScreen({ dev }: { dev: BondedDevice }) {
+  const found = findProfile(dev.name);
+  if (found) return <ProfileScreen key={found.profile.id} dev={dev} profile={found.profile} model={found.model} />;
   return (
     <Card>
       <Row title={dev.name} subtitle={dev.address} />
-      {err ? <Row title={err} last /> : entry === undefined ? <Row title="Ищу поддержку на GitHub…" last />
-        : entry === null ? <Row title="Для этих наушников поддержки пока нет" last /> : (
-          <Row title={`Есть поддержка: ${entry.name}`} subtitle="Профиль — несколько килобайт" last disabled={busy}
-            onPress={async () => {
-              setBusy(true);
-              try { await download(entry); onProfile(); } catch (e) { setErr(String((e as Error).message)); setBusy(false); }
-            }}
-            right={<Text style={[st.pickValue, { color: C.accent, fontWeight: '700' }]}>{busy ? 'Скачиваю…' : 'Скачать'}</Text>} />
-        )}
+      <Row title="Эти наушники пока не поддерживаются" last
+        subtitle="Сейчас приложение умеет CMF Buds / Nothing, AirPods, Samsung Galaxy Buds и Sony" />
     </Card>
   );
-}
-
-function OtherScreen({ dev }: { dev: BondedDevice }) {
-  const [found, setFound] = useState<{ profile: Profile; model: ProfileModel } | null | undefined>(undefined);
-  const [n, setN] = useState(0);
-  useEffect(() => { findLocal(dev.name).then(setFound); }, [dev.name, n]);
-  if (found === undefined) return null;
-  return found ? <ProfileScreen key={found.profile.id} dev={dev} profile={found.profile} model={found.model} />
-    : <UnknownScreen dev={dev} onProfile={() => setN((x) => x + 1)} />;
 }
 
 // --- приложение -----------------------------------------------------------------------
