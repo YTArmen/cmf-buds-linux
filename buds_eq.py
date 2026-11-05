@@ -88,6 +88,30 @@ def set_volume(name, vol):
         subprocess.run(["wpctl", "set-volume", str(i), f"{vol:.3f}"], capture_output=True, timeout=5)
 
 
+def streams_into(node):
+    """Потоки (плееры), которые сейчас играют в узел node."""
+    ids = set()
+    for o in _dump():
+        if o.get("type", "").endswith("Link"):
+            info = o.get("info") or {}
+            if info.get("input-node-id") == node:
+                ids.add(info.get("output-node-id"))
+    return [i for i in ids if i is not None]
+
+
+def move_streams(node, target_name):
+    """Перевести плееры из node в другой выход на лету (без паузы)."""
+    target = node_id(target_name)
+    if target is None:
+        return 0
+    moved = 0
+    for sid in streams_into(node):
+        subprocess.run(["pw-metadata", str(sid), "target.object", target_name], capture_output=True, timeout=5)
+        subprocess.run(["pw-metadata", str(sid), "target.node", str(target)], capture_output=True, timeout=5)
+        moved += 1
+    return moved
+
+
 def preamp(gains):
     """Чтобы не было хрипа при подъёме полос, общий уровень чуть снижаем (на половину самого большого подъёма)."""
     return 10 ** (-max(0, max(gains)) / 2 / 20)
@@ -188,16 +212,24 @@ context.modules = [
                        capture_output=True, timeout=5)
 
     def stop(self):
+        back = self.prev_default or self.target
         if self.running and self.target:
             vol = get_volume(self.name)  # вернуть наушникам ту громкость, что была у эквалайзера
             if vol is not None:
                 set_volume(self.target, vol)
-        if self.proc:
+            # сначала увести звук из эквалайзера, потом закрыть его — иначе плееры встают на паузу
+            if back and node_id(back) is not None:
+                set_default(back)
+                if self.node is not None and move_streams(self.node, back):
+                    for _ in range(20):
+                        if not streams_into(self.node):
+                            break
+                        time.sleep(0.05)
             self.proc.terminate()
             try:
                 self.proc.wait(3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
         self.proc, self.node = None, None
-        if self.prev_default and default_sink_name() in (None, self.name):
-            set_default(self.prev_default)
+        if back and default_sink_name() in (None, self.name):
+            set_default(back)
