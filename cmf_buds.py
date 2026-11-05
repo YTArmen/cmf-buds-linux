@@ -7,6 +7,7 @@ AirPods: Bluetooth L2CAP, PSM 0x1001, протокол Apple AAP (пакеты 0
 Проверено 05.11.2026 на AirPods Pro 2.
 Неофициальная программа, не связана с Nothing Technology и Apple.
 """
+import json
 import os
 import socket
 import subprocess
@@ -34,6 +35,9 @@ AIRPODS_MODELS = {0x2002: "AirPods", 0x200F: "AirPods 2", 0x2013: "AirPods 3",
                   0x200E: "AirPods Pro", 0x2014: "AirPods Pro 2",
                   0x2024: "AirPods Pro 2 (USB-C)", 0x200A: "AirPods Max",
                   0x2019: "AirPods 4", 0x201B: "AirPods 4 (шумоподавление)"}
+
+
+AIRPODS_MODEL_OF = {}  # адрес -> модель по Modalias
 
 
 def find_devices():
@@ -65,7 +69,8 @@ def find_devices():
                     pid = int(ln.split("v004Cp")[1][:4], 16)
                     model = AIRPODS_MODELS.get(pid, name)
             if "AIRPODS" in model.upper() or "AIRPODS" in name.upper():
-                found.append(("airpods", mac, model))
+                AIRPODS_MODEL_OF[mac] = model
+                found.append(("airpods", mac, name))  # на вкладке — имя из Bluetooth
     return found
 
 
@@ -80,8 +85,19 @@ class Link:
     def __init__(self, mac, on_packet, on_state):
         self.mac, self.on_packet, self.on_state = mac, on_packet, on_state
         self.sock = None
+        self.enabled = True  # False — наушники скрыты, не подключаться
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def set_enabled(self, on):
+        self.enabled = on
+        if not on:
+            with self.lock:
+                if self.sock:
+                    try:
+                        self.sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
 
     def send_raw(self, data):
         with self.lock:
@@ -97,7 +113,7 @@ class Link:
         while True:
             # Ждём, пока наушники подключит сама система. Если подключиться первыми,
             # система решит, что связь уже есть, и не включит звук (A2DP).
-            if not is_connected(self.mac):
+            if not self.enabled or not is_connected(self.mac):
                 time.sleep(3)
                 continue
             time.sleep(2)  # дать системе подключить звук
@@ -203,7 +219,7 @@ AAP_FEATURES = bytes.fromhex("040004004d00d700000000000000")
 AAP_NOTIFY = bytes.fromhex("040004000f00ffffffff")
 AAP_HEADER = b"\x04\x00\x04\x00"
 OP_BATTERY, OP_EAR, OP_CONTROL = 0x04, 0x06, 0x09
-CTL_NOISE, CTL_ONE_BUD_ANC, CTL_CONVERSATION = 0x0D, 0x1B, 0x28
+CTL_NOISE, CTL_EAR_DETECT, CTL_ONE_BUD_ANC, CTL_CONVERSATION = 0x0D, 0x0A, 0x1B, 0x28
 NOISE_MODES = [("off", 1, "Выкл"), ("anc", 2, "Шумоподав."),
                ("transp", 3, "Прозрачность"), ("adaptive", 4, "Адаптивный")]
 EAR_IN, EAR_OUT, EAR_CASE = 0, 1, 2
@@ -235,19 +251,48 @@ class AirPodsLink(Link):
                 self.on_packet(data[4] | (data[5] << 8), data[6:])
 
 
-def pause_media():
-    """Поставить на паузу все плееры (MPRIS через D-Bus), без лишних программ."""
+def _mpris(method, only=None):
+    """Позвать метод у плееров MPRIS через D-Bus. Возвращает плееры, у которых сработало.
+
+    method='Pause' трогает только играющие плееры; only — список плееров для 'Play'.
+    """
+    done = []
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         names = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
                               "org.freedesktop.DBus", "ListNames", None, None,
                               Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
         for name in names:
-            if name.startswith("org.mpris.MediaPlayer2."):
-                bus.call(name, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player",
-                         "Pause", None, None, Gio.DBusCallFlags.NONE, 2000, None, None)
+            if not name.startswith("org.mpris.MediaPlayer2."):
+                continue
+            if only is not None and name not in only:
+                continue
+            try:
+                status = bus.call_sync(
+                    name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "Get",
+                    GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", "PlaybackStatus")),
+                    None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+            except GLib.Error:
+                continue
+            if (method == "Pause" and status != "Playing") or (method == "Play" and status == "Playing"):
+                continue
+            bus.call(name, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player",
+                     method, None, None, Gio.DBusCallFlags.NONE, 2000, None, None)
+            done.append(name)
     except GLib.Error:
         pass
+    return done
+
+
+def pause_media():
+    """Поставить на паузу то, что играет. Вернёт список плееров, чтобы потом продолжить."""
+    return _mpris("Pause")
+
+
+def resume_media(players):
+    """Продолжить только те плееры, которые мы сами поставили на паузу."""
+    if players:
+        _mpris("Play", only=players)
 
 
 # --- страницы окна ---------------------------------------------------------
@@ -456,6 +501,7 @@ class AirPodsPage(DevicePage):
         super().__init__(mac)
         page = self.page
         self.ears = (None, None)
+        self.paused_by_us = []  # плееры, которые мы поставили на паузу
         # 0x04 = левый, 0x02 = правый, 0x08 = кейс
         self.batt = self.battery_group([(0x04, "Левый"), (0x02, "Правый"), (0x08, "Кейс")])
 
@@ -485,8 +531,16 @@ class AirPodsPage(DevicePage):
         g = Adw.PreferencesGroup(title="В ушах")
         self.ear_row = Adw.ActionRow(title="Сейчас", subtitle="—")
         g.add(self.ear_row)
+        self.ear_detect = Adw.SwitchRow(
+            title="Автоопределение уха",
+            subtitle="Наушники сами понимают, что они в ушах. Если выключить, "
+                     "звук всегда идёт в наушники, а пауза не срабатывает",
+            active=True)
+        self.ear_detect.connect("notify::active", self.on_switch, CTL_EAR_DETECT)
+        g.add(self.ear_detect)
         self.autopause = Adw.SwitchRow(title="Пауза, когда вынимаете наушник",
-                                       subtitle="Музыка и видео на компьютере встанут на паузу",
+                                       subtitle="Музыка и видео встанут на паузу, "
+                                                "а когда вставите обратно — продолжатся",
                                        active=True)
         g.add(self.autopause)
         page.add(g)
@@ -500,7 +554,7 @@ class AirPodsPage(DevicePage):
         self.link = AirPodsLink(mac, self.packet_from_thread, self.state_from_thread)
 
     def set_controls_sensitive(self, ok):
-        for w in [self.noise, self.conversation, self.one_bud, self.autopause]:
+        for w in [self.noise, self.conversation, self.one_bud, self.ear_detect, self.autopause]:
             w.set_sensitive(ok)
 
     def read_all(self):
@@ -530,6 +584,9 @@ class AirPodsPage(DevicePage):
                 self.conversation.set_active(val == 1)
             elif ctl == CTL_ONE_BUD_ANC:
                 self.one_bud.set_active(val == 1)
+            elif ctl == CTL_EAR_DETECT:
+                self.ear_detect.set_active(val == 1)
+                self.autopause.set_sensitive(val == 1)
         elif op == OP_EAR and len(p) >= 2:
             self.show_ears(p[0], p[1])
 
@@ -540,8 +597,20 @@ class AirPodsPage(DevicePage):
             text = "Оба в кейсе" if a == b == EAR_CASE else "Не в ушах"
         self.ear_row.set_subtitle(text)
         before = [x for x in self.ears if x is not None].count(EAR_IN)
-        if self.ears != (None, None) and in_ear < before and self.autopause.get_active():
-            pause_media()
+        known = self.ears != (None, None)
+        auto = self.autopause.get_active() and self.ear_detect.get_active()
+        if a == b == EAR_CASE:
+            if known and auto and before:
+                pause_media()
+            self.paused_by_us = []  # убрали в кейс — потом сами не продолжаем
+        elif known and auto and in_ear < before and before == 2:
+            # вынули наушник: пауза; запомнить, что ставили мы
+            self.paused_by_us = pause_media() or self.paused_by_us
+        elif known and in_ear == 2 and before < 2 and self.paused_by_us:
+            # вставили обратно: продолжить
+            if auto:
+                resume_media(self.paused_by_us)
+            self.paused_by_us = []
         self.ears = (a, b)
 
     def on_noise(self, *_):
@@ -552,51 +621,106 @@ class AirPodsPage(DevicePage):
             self.link.set_control(CTL_NOISE, val)
 
     def on_switch(self, row, _pspec, ctl):
+        if ctl == CTL_EAR_DETECT:
+            self.autopause.set_sensitive(row.get_active())
         if not self.busy:
             self.link.set_control(ctl, 1 if row.get_active() else 2)
 
 
 # --- окно ------------------------------------------------------------------
+CONFIG = os.path.join(GLib.get_user_config_dir(), "cmf-buds", "settings.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Наушники")
         self.set_default_size(460, 780)
+        self.cfg = load_config()
+        self.hidden = set(self.cfg.get("hidden", []))
 
         view = Adw.ToolbarView()
-        header = Adw.HeaderBar()
+        self.header = Adw.HeaderBar()
         refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Обновить")
         refresh.connect("clicked", self.on_refresh)
-        header.pack_end(refresh)
-        view.add_top_bar(header)
+        self.header.pack_end(refresh)
+        view.add_top_bar(self.header)
         self.set_content(view)
 
         self.stack = Adw.ViewStack()
-        devices = find_devices()
-        if not devices:
+        self.devices = find_devices()
+        if not self.devices:
             view.set_content(Adw.StatusPage(
                 icon_name="audio-headphones-symbolic", title="Наушники не найдены",
                 description="Сначала подключите CMF Buds или AirPods в настройках Bluetooth, "
                             "потом откройте программу снова."))
             return
-        for kind, mac, name in devices:
+
+        self.pages = {}
+        menu = Gio.Menu()
+        section = Gio.Menu()
+        for kind, mac, name in self.devices:
             if kind == "cmf":
                 page = CmfPage(mac)
                 icon = "audio-headphones-symbolic"
             else:
-                page = AirPodsPage(mac, name)
+                page = AirPodsPage(mac, AIRPODS_MODEL_OF.get(mac, name))
                 icon = "audio-headset-symbolic"
-            self.stack.add_titled_with_icon(page, mac, name, icon)
-        # первыми показать те наушники, что сейчас подключены
-        for kind, mac, _ in devices:
-            if is_connected(mac):
-                self.stack.set_visible_child_name(mac)
-                break
-        if len(devices) > 1:
-            header.set_title_widget(Adw.ViewSwitcher(stack=self.stack,
-                                                     policy=Adw.ViewSwitcherPolicy.WIDE))
-        else:
-            self.set_title(devices[0][2])
+            self.pages[mac] = (self.stack.add_titled_with_icon(page, mac, name, icon), page)
+            act = Gio.SimpleAction.new_stateful(
+                "show-" + mac.replace(":", ""), None, GLib.Variant.new_boolean(mac not in self.hidden))
+            act.connect("change-state", self.on_toggle_device, mac)
+            self.add_action(act)
+            section.append(name, "win.show-" + mac.replace(":", ""))
+        menu.append_section("Показывать наушники", section)
+        if len(self.devices) > 1:
+            self.header.pack_end(Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=menu,
+                                                tooltip_text="Какие наушники показывать"))
+        self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         view.set_content(self.stack)
+        self.apply_visibility(prefer_connected=True)
+
+    def apply_visibility(self, prefer_connected=False):
+        visible = [d for d in self.devices if d[1] not in self.hidden] or self.devices[:1]
+        for kind, mac, _ in self.devices:
+            stack_page, page = self.pages[mac]
+            on = any(v[1] == mac for v in visible)
+            stack_page.set_visible(on)
+            page.link.set_enabled(on)
+        # открыть подключённые наушники, иначе первые видимые
+        current = self.stack.get_visible_child_name()
+        if prefer_connected or not any(v[1] == current for v in visible):
+            pick = next((v for v in visible if is_connected(v[1])), visible[0])
+            self.stack.set_visible_child_name(pick[1])
+        if len(visible) > 1:
+            self.header.set_title_widget(self.switcher)
+        else:
+            self.header.set_title_widget(None)
+            self.set_title(visible[0][2])
+
+    def on_toggle_device(self, action, value, mac):
+        on = value.get_boolean()
+        others = [d for d in self.devices if d[1] != mac and d[1] not in self.hidden]
+        if not on and not others:
+            return  # последние видимые наушники не скрываем
+        action.set_state(value)
+        (self.hidden.discard if on else self.hidden.add)(mac)
+        self.cfg["hidden"] = sorted(self.hidden)
+        save_config(self.cfg)
+        self.apply_visibility()
 
     def on_refresh(self, *_):
         page = self.stack.get_visible_child()
