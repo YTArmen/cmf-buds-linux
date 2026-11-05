@@ -99,13 +99,15 @@ def streams_into(node):
     return [i for i in ids if i is not None]
 
 
-def move_streams(node, target_name):
+def move_streams(node, target_name, skip=()):
     """Перевести плееры из node в другой выход на лету (без паузы)."""
     target = node_id(target_name)
     if target is None:
         return 0
     moved = 0
     for sid in streams_into(node):
+        if sid in skip:
+            continue
         subprocess.run(["pw-metadata", str(sid), "target.object", target_name], capture_output=True, timeout=5)
         subprocess.run(["pw-metadata", str(sid), "target.node", str(target)], capture_output=True, timeout=5)
         moved += 1
@@ -197,8 +199,22 @@ context.modules = [
         self.target = target
         vol = get_volume(target)
         set_volume(self.name, vol if vol is not None else 0.5)
-        set_volume(target, 1.0)
+        # 1) сначала перевести плееры в эквалайзер (громкость прежняя)
         set_default(self.name)
+        hp = node_id(target)
+        out = node_id(self.name + ".out")
+        if hp is not None:
+            move_streams(hp, self.name, skip={out})
+            for _ in range(40):  # ждём, пока напрямую в наушники не играет никто, кроме эквалайзера
+                if not [i for i in streams_into(hp) if i != out]:
+                    break
+                time.sleep(0.05)
+        # 2) только теперь наушники на 100 % — громкостью управляет эквалайзер.
+        #    Если кто-то всё ещё играет напрямую, не трогаем: лучше тише, чем больно.
+        if hp is not None and not [i for i in streams_into(hp) if i != out]:
+            set_volume(target, 1.0)
+        else:
+            set_volume(self.name, 1.0)
         return None
 
     def set_gains(self, gains):
