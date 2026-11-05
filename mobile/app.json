@@ -60,6 +60,11 @@
         }
       ]
     ],
-    "owner": "yt_armen"
+    "owner": "yt_armen",
+    "extra": {
+      "eas": {
+        "projectId": "110ec2ca-4270-488f-a079-fbc20f81696b"
+      }
+    }
   }
 }
