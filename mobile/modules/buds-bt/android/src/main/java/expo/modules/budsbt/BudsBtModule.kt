@@ -45,7 +45,11 @@ class BudsBtModule : Module() {
 
     Function("bondedDevices") {
       val list: List<Map<String, String>> = adapter?.bondedDevices
-        ?.map { d: BluetoothDevice -> mapOf("address" to d.address, "name" to (d.name ?: "")) }
+        ?.map { d: BluetoothDevice ->
+          // AUDIO_VIDEO = 0x0400: наушники, гарнитуры, колонки
+          val audio = d.bluetoothClass?.majorDeviceClass == 0x0400
+          mapOf("address" to d.address, "name" to (d.name ?: ""), "audio" to (if (audio) "1" else "0"))
+        }
         ?: emptyList()
       list
     }

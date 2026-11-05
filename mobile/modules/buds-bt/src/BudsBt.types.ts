@@ -8,4 +8,4 @@ export type BudsBtModuleEvents = {
   onAppleAdv: (e: AppleAdvEvent) => void;
 };
 
-export type BondedDevice = { address: string; name: string };
+export type BondedDevice = { address: string; name: string; audio?: string };

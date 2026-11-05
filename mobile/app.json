@@ -2,7 +2,7 @@
   "expo": {
     "name": "Наушники",
     "slug": "buds-control",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -12,7 +12,7 @@
     ],
     "android": {
       "package": "io.github.ytarmen.buds",
-      "versionCode": 2,
+      "versionCode": 3,
       "adaptiveIcon": {
         "backgroundColor": "#0E0E10",
         "foregroundImage": "./assets/android-icon-foreground.png",

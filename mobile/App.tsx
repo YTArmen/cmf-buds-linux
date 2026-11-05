@@ -8,6 +8,8 @@ import {
 import BudsBt, { BondedDevice } from './modules/buds-bt/src/BudsBtModule';
 import { AirPodsInfo, parseAdv } from './src/airpods';
 import * as cmf from './src/cmf';
+import { Changes, CODECS, Noise, Profile, ProfileModel } from './src/codecs';
+import { download, findLocal, findRemote, IndexEntry } from './src/profiles';
 import { saveBattery } from './src/store';
 import { Banner, BatteryCell, C, Card, fadeSwap, Segmented } from './src/ui';
 import Animated from 'react-native-reanimated';
@@ -266,11 +268,138 @@ function AirPodsScreen({ bonded }: { bonded?: BondedDevice }) {
   );
 }
 
+// --- другие марки: по профилю ---------------------------------------------------------------
+const NOISE_LABEL: Record<Noise, string> = { off: 'Выкл', anc: 'Шумоподав.', transparency: 'Прозрачн.', adaptive: 'Адаптив.' };
+const EARS_LABEL = { both: 'Оба наушника в ушах', one: 'Один наушник в ухе', case: 'В кейсе', none: 'Не в ушах' };
+
+function ProfileScreen({ dev, profile, model }: { dev: BondedDevice; profile: Profile; model: ProfileModel }) {
+  const [info, setInfo] = useState<Changes>({});
+  const [status, setStatus] = useState<'connecting' | 'on' | 'off'>('connecting');
+  const [error, setError] = useState<string>();
+  const codec = useRef<ReturnType<typeof makeCodec> | null>(null);
+  const uuids = model.uuids ?? (model.uuid ? [model.uuid] : []);
+  const [attempt, setAttempt] = useState(0);
+
+  function makeCodec() {
+    const Cls = CODECS[profile.codec];
+    return new Cls(model, (bytes) => BudsBt.writeSpp(dev.address, bytes.map((b) => b.toString(16).padStart(2, '0')).join('')));
+  }
+
+  useEffect(() => {
+    let uuidIdx = 0;
+    const tryNext = () => BudsBt.connectSpp(dev.address, uuids[uuidIdx] ?? '', -1).catch((e) => setError(String(e?.message ?? e)));
+    const s1 = BudsBt.addListener('onSppState', (e) => {
+      if (e.address !== dev.address) return;
+      if (e.connected) {
+        setStatus('on');
+        setError(undefined);
+        codec.current = makeCodec();
+        codec.current.start();
+      } else if (e.error && uuidIdx + 1 < uuids.length) {
+        uuidIdx += 1;
+        tryNext(); // у Sony две службы: пробуем вторую
+      } else {
+        setStatus('off');
+        if (e.error) setError(e.error);
+      }
+    });
+    const s2 = BudsBt.addListener('onSppData', (e) => {
+      if (e.address !== dev.address || !codec.current) return;
+      const ch = codec.current.feed(Array.from({ length: e.hex.length / 2 }, (_, i) => parseInt(e.hex.substr(i * 2, 2), 16)));
+      if (Object.keys(ch).length) setInfo((o) => ({ ...o, ...ch }));
+    });
+    tryNext();
+    const poll = setInterval(() => codec.current?.poll(), 30_000);
+    return () => { s1.remove(); s2.remove(); clearInterval(poll); BudsBt.disconnectSpp(dev.address); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dev.address, attempt]);
+
+  useEffect(() => {
+    if (info.left != null || info.right != null) {
+      saveBattery('profile', {
+        name: dev.name, left: info.left, right: info.right, case: info.case,
+        leftCh: info.left_ch, rightCh: info.right_ch, caseCh: info.case_ch, at: Date.now(),
+      });
+    }
+  }, [info.left, info.right, info.case, info.left_ch, info.right_ch, info.case_ch, dev.name]);
+
+  const on = status === 'on';
+  const modes = (model.modes ?? []).filter((m) => NOISE_LABEL[m]);
+  return (
+    <>
+      {!on && (
+        <Banner onPress={() => { setStatus('connecting'); setAttempt((a) => a + 1); }}
+          text={status === 'connecting' ? 'Подключаюсь к наушникам…'
+            : `Наушники не на связи. Нажмите здесь, чтобы попробовать снова.${error ? `\n(${error})` : ''}`} />
+      )}
+      <Card>
+        <View style={st.battRow}>
+          <BatteryCell label="Левый" value={info.left} charging={info.left_ch} />
+          <BatteryCell label="Правый" value={info.right} charging={info.right_ch} />
+          <BatteryCell label="Кейс" value={info.case} charging={info.case_ch} />
+        </View>
+      </Card>
+      {modes.length > 0 && (
+        <Card title="Шумоподавление" index={1}>
+          <View style={{ padding: 12 }}>
+            <Segmented disabled={!on} value={info.noise} items={modes.map((m) => [m, NOISE_LABEL[m]])}
+              onChange={(m) => { setInfo((o) => ({ ...o, noise: m })); codec.current?.setNoise(m); }} />
+          </View>
+        </Card>
+      )}
+      <Card title="Об устройстве" index={2}>
+        <Row title="В ушах" right={<Text style={st.pickValue}>{info.ears ? EARS_LABEL[info.ears] : '—'}</Text>} />
+        <Row title="Профиль" right={<Text style={st.pickValue}>{profile.name}</Text>} />
+        <Row title="Адрес" last right={<Text style={st.pickValue}>{dev.address}</Text>} />
+      </Card>
+      {profile.tested === false && (
+        <Text style={st.note}>
+          Профиль собран по описаниям из открытых проектов и ещё не проверен на настоящих наушниках.
+          Если что-то не работает — напишите нам на GitHub.
+        </Text>
+      )}
+    </>
+  );
+}
+
+/** Наушники без профиля: ищем поддержку на GitHub и предлагаем скачать. */
+function UnknownScreen({ dev, onProfile }: { dev: BondedDevice; onProfile: () => void }) {
+  const [entry, setEntry] = useState<IndexEntry | null | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string>();
+  useEffect(() => {
+    findRemote(dev.name).then(setEntry).catch(() => setErr('Нет связи с GitHub'));
+  }, [dev.name]);
+  return (
+    <Card>
+      <Row title={dev.name} subtitle={dev.address} />
+      {err ? <Row title={err} last /> : entry === undefined ? <Row title="Ищу поддержку на GitHub…" last />
+        : entry === null ? <Row title="Для этих наушников поддержки пока нет" last /> : (
+          <Row title={`Есть поддержка: ${entry.name}`} subtitle="Профиль — несколько килобайт" last disabled={busy}
+            onPress={async () => {
+              setBusy(true);
+              try { await download(entry); onProfile(); } catch (e) { setErr(String((e as Error).message)); setBusy(false); }
+            }}
+            right={<Text style={[st.pickValue, { color: C.accent, fontWeight: '700' }]}>{busy ? 'Скачиваю…' : 'Скачать'}</Text>} />
+        )}
+    </Card>
+  );
+}
+
+function OtherScreen({ dev }: { dev: BondedDevice }) {
+  const [found, setFound] = useState<{ profile: Profile; model: ProfileModel } | null | undefined>(undefined);
+  const [n, setN] = useState(0);
+  useEffect(() => { findLocal(dev.name).then(setFound); }, [dev.name, n]);
+  if (found === undefined) return null;
+  return found ? <ProfileScreen key={found.profile.id} dev={dev} profile={found.profile} model={found.model} />
+    : <UnknownScreen dev={dev} onProfile={() => setN((x) => x + 1)} />;
+}
+
 // --- приложение -----------------------------------------------------------------------
 export default function App() {
   const [ready, setReady] = useState<boolean | null>(null);
   const [devices, setDevices] = useState<BondedDevice[]>([]);
-  const [tab, setTab] = useState<'cmf' | 'airpods'>();
+  const [tab, setTab] = useState<string>();
 
   const init = useCallback(async () => {
     const ok = await askPermissions();
@@ -286,7 +415,13 @@ export default function App() {
 
   const cmfDev = devices.find((d) => d.name.toUpperCase().startsWith('CMF'));
   const podsDev = devices.find((d) => d.name.toUpperCase().includes('AIRPODS'));
+  const others = devices.filter((d) => d !== cmfDev && d !== podsDev && d.audio === '1');
+  const tabs: [string, string][] = [
+    ['cmf', cmfDev?.name ?? 'CMF Buds'], ['airpods', podsDev?.name ?? 'AirPods'],
+    ...others.map((d): [string, string] => [d.address, d.name]),
+  ];
   const current = tab ?? (cmfDev && !podsDev ? 'cmf' : podsDev || !cmfDev ? 'airpods' : 'cmf');
+  const otherDev = others.find((d) => d.address === current);
 
   let body: React.ReactNode;
   if (ready === null) body = null;
@@ -304,15 +439,14 @@ export default function App() {
     body = (
       <>
         <View style={{ marginBottom: 18 }}>
-          <Segmented value={current} onChange={setTab}
-            items={[['cmf', cmfDev?.name ?? 'CMF Buds'], ['airpods', podsDev?.name ?? 'AirPods']]} />
+          <Segmented value={current} onChange={setTab} items={tabs} />
         </View>
         <Animated.View key={current} entering={fadeSwap}>
         {current === 'cmf' ? (
           cmfDev ? <CmfScreen key={cmfDev.address} dev={cmfDev} /> : (
             <Card><Row title="CMF Buds не найдены" subtitle="Сначала подключите их в настройках Bluetooth телефона, потом нажмите здесь" last onPress={init} /></Card>
           )
-        ) : <AirPodsScreen bonded={podsDev} />}
+        ) : otherDev ? <OtherScreen dev={otherDev} /> : <AirPodsScreen bonded={podsDev} />}
         </Animated.View>
       </>
     );
