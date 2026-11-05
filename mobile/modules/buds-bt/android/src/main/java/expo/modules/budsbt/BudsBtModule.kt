@@ -23,7 +23,11 @@ import java.util.concurrent.ConcurrentHashMap
  */
 @SuppressLint("MissingPermission")
 class BudsBtModule : Module() {
-  private val sockets = ConcurrentHashMap<String, BluetoothSocket>()
+  companion object {
+    // общие для приложения и виджета (виджет может работать в другом экземпляре модуля)
+    val sockets = ConcurrentHashMap<String, BluetoothSocket>()
+  }
+
   private var scanCallback: ScanCallback? = null
 
   private val adapter: BluetoothAdapter?
@@ -50,6 +54,8 @@ class BudsBtModule : Module() {
       val dev = adapter?.getRemoteDevice(address) ?: throw Exception("Bluetooth выключен")
       Thread { runSpp(dev, uuid, channel) }.start()
     }
+
+    Function("isSppConnected") { address: String -> sockets[address]?.isConnected == true }
 
     Function("disconnectSpp") { address: String ->
       sockets.remove(address)?.let { runCatching { it.close() } }
@@ -85,8 +91,6 @@ class BudsBtModule : Module() {
     }
 
     OnDestroy {
-      sockets.values.forEach { runCatching { it.close() } }
-      sockets.clear()
       scanCallback?.let { cb -> runCatching { adapter?.bluetoothLeScanner?.stopScan(cb) } }
     }
   }

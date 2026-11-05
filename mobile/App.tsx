@@ -9,11 +9,8 @@ import BudsBt, { BondedDevice } from './modules/buds-bt/src/BudsBtModule';
 import { AirPodsInfo, parseAdv } from './src/airpods';
 import * as cmf from './src/cmf';
 import { saveBattery } from './src/store';
-
-const C = {
-  bg: '#0E0E10', card: '#1C1C1E', line: '#2C2C2E', text: '#F2F2F7', sub: '#8E8E93',
-  accent: '#E8452C', green: '#34C759', yellow: '#FFD60A', red: '#FF453A',
-};
+import { Banner, BatteryCell, C, Card, fadeSwap, Segmented } from './src/ui';
+import Animated from 'react-native-reanimated';
 
 // --- разрешения --------------------------------------------------------------
 async function askPermissions(): Promise<boolean> {
@@ -32,7 +29,7 @@ const emptyCmf: cmf.CmfState = { battery: {}, gestures: {} };
 
 function useCmf(dev?: BondedDevice) {
   const [state, setState] = useState<cmf.CmfState>(emptyCmf);
-  const [status, setStatus] = useState<'off' | 'connecting' | 'on'>('off');
+  const [status, setStatus] = useState<'off' | 'connecting' | 'on'>('connecting');
   const [error, setError] = useState<string>();
   const buf = useRef<number[]>([]);
 
@@ -44,15 +41,21 @@ function useCmf(dev?: BondedDevice) {
     Object.values(cmf.READ).forEach((c) => send(c));
   }, [send]);
 
-  const connect = useCallback(() => {
+  // само подключение — без изменения состояния (его меняют ответы модуля)
+  const open = useCallback(() => {
     if (!dev) return;
-    setStatus('connecting');
-    setError(undefined);
     BudsBt.connectSpp(dev.address, cmf.CMF_UUID, cmf.CMF_CHANNEL).catch((e) => {
       setStatus('off');
       setError(String(e?.message ?? e));
     });
   }, [dev]);
+
+  // повтор по нажатию на баннер
+  const connect = useCallback(() => {
+    setStatus('connecting');
+    setError(undefined);
+    open();
+  }, [open]);
 
   useEffect(() => {
     if (!dev) return;
@@ -70,18 +73,18 @@ function useCmf(dev?: BondedDevice) {
       buf.current = cmf.parseStream([...buf.current, ...cmf.hexToBytes(e.hex)], (cmd, p) =>
         setState((s) => cmf.applyPacket(s, cmd, p)));
     });
-    connect();
+    open();
     const poll = setInterval(() => send(cmf.READ.battery), 30_000);
     return () => {
       s1.remove(); s2.remove(); clearInterval(poll);
       BudsBt.disconnectSpp(dev.address);
     };
-  }, [dev, connect, readAll, send]);
+  }, [dev, open, readAll, send]);
 
   useEffect(() => {
     const b = state.battery;
-    if (dev && b.left != null) saveBattery('cmf', { name: dev.name, ...b, at: Date.now() });
-  }, [state.battery, dev]);
+    if (dev && b.left != null) saveBattery('cmf', { name: dev.name, address: dev.address, ...b, anc: state.anc, at: Date.now() });
+  }, [state.battery, state.anc, dev]);
 
   return { state, setState, status, error, send, connect, readAll };
 }
@@ -116,44 +119,6 @@ function useAirPods(enabled: boolean) {
 }
 
 // --- маленькие компоненты ------------------------------------------------------------
-function Card({ title, children }: { title?: string; children: React.ReactNode }) {
-  return (
-    <View style={{ marginBottom: 18 }}>
-      {title ? <Text style={st.cardTitle}>{title}</Text> : null}
-      <View style={st.card}>{children}</View>
-    </View>
-  );
-}
-
-function BatteryCell({ label, value, charging, extra }: { label: string; value?: number; charging?: boolean; extra?: string }) {
-  const color = value == null ? C.line : value <= 20 ? C.red : value <= 40 ? C.yellow : C.green;
-  return (
-    <View style={st.battCell}>
-      <Text style={st.battValue}>{value == null ? '—' : `${value}%`}{charging ? ' ⚡' : ''}</Text>
-      <View style={st.battTrack}>
-        <View style={[st.battFill, { width: `${value ?? 0}%`, backgroundColor: color }]} />
-      </View>
-      <Text style={st.battLabel}>{label}</Text>
-      {extra ? <Text style={st.battExtra}>{extra}</Text> : null}
-    </View>
-  );
-}
-
-function Segmented<T extends string | number>({ items, value, onChange, disabled }: {
-  items: [T, string][]; value?: T; onChange: (v: T) => void; disabled?: boolean;
-}) {
-  return (
-    <View style={[st.seg, disabled && { opacity: 0.4 }]}>
-      {items.map(([v, label]) => (
-        <Pressable key={String(v)} disabled={disabled} onPress={() => onChange(v)}
-          style={[st.segItem, value === v && st.segActive]}>
-          <Text style={[st.segText, value === v && { color: '#fff', fontWeight: '700' }]} numberOfLines={1}>{label}</Text>
-        </Pressable>
-      ))}
-    </View>
-  );
-}
-
 function Row({ title, subtitle, right, onPress, last, disabled }: {
   title: string; subtitle?: string; right?: React.ReactNode; onPress?: () => void; last?: boolean; disabled?: boolean;
 }) {
@@ -214,12 +179,9 @@ function CmfScreen({ dev }: { dev: BondedDevice }) {
   return (
     <>
       {!on && (
-        <Pressable style={st.banner} onPress={connect}>
-          <Text style={st.bannerText}>
-            {status === 'connecting' ? 'Подключаюсь к наушникам…'
-              : `Наушники не на связи. Достаньте их из кейса и нажмите здесь.${error ? `\n(${error})` : ''}`}
-          </Text>
-        </Pressable>
+        <Banner onPress={connect}
+          text={status === 'connecting' ? 'Подключаюсь к наушникам…'
+            : `Наушники не на связи. Достаньте их из кейса и нажмите здесь.${error ? `\n(${error})` : ''}`} />
       )}
       <Card>
         <View style={st.battRow}>
@@ -229,7 +191,7 @@ function CmfScreen({ dev }: { dev: BondedDevice }) {
         </View>
       </Card>
 
-      <Card title="Шумоподавление">
+      <Card title="Шумоподавление" index={1}>
         <View style={{ padding: 12 }}>
           <Segmented disabled={!on} value={ancMode}
             items={[['off', 'Выкл'], ['transp', 'Прозрачность'], ['anc', 'Шумоподав.']]}
@@ -240,7 +202,7 @@ function CmfScreen({ dev }: { dev: BondedDevice }) {
         )}
       </Card>
 
-      <Card title="Звук">
+      <Card title="Звук" index={2}>
         <Picker title="Эквалайзер" items={cmf.EQ_PRESETS} value={state.eq} disabled={!on}
           onChange={(v) => { setState((s) => ({ ...s, eq: v })); send(cmf.SET.eq, [v, 0]); }} />
         <Row title="Ultra Bass" subtitle="Усиление низких частот" disabled={!on}
@@ -258,7 +220,7 @@ function CmfScreen({ dev }: { dev: BondedDevice }) {
       </Card>
 
       {cmf.SIDES.map(([side, sideName]) => (
-        <Card key={side} title={`Жесты — ${sideName.toLowerCase()} наушник`}>
+        <Card key={side} index={side + 1} title={`Жесты — ${sideName.toLowerCase()} наушник`}>
           {cmf.GESTURES.map(([g, gName], i) => (
             <Picker key={g} title={gName} items={cmf.ACTIONS} value={state.gestures[`${side}:${g}`]}
               last={i === cmf.GESTURES.length - 1} disabled={!on}
@@ -270,7 +232,7 @@ function CmfScreen({ dev }: { dev: BondedDevice }) {
         </Card>
       ))}
 
-      <Card title="Об устройстве">
+      <Card title="Об устройстве" index={5}>
         <Row title="Прошивка" right={<Text style={st.pickValue}>{state.fw ?? '—'}</Text>} />
         <Row title="Адрес" last right={<Text style={st.pickValue}>{dev.address}</Text>} />
       </Card>
@@ -283,13 +245,7 @@ function AirPodsScreen({ bonded }: { bonded?: BondedDevice }) {
   const ear = (v?: boolean) => (v ? 'в ухе' : undefined);
   return (
     <>
-      {!info && (
-        <View style={st.banner}>
-          <Text style={st.bannerText}>
-            Ищу AirPods рядом… Откройте кейс возле телефона или наденьте наушники.
-          </Text>
-        </View>
-      )}
+      {!info && <Banner text="Ищу AirPods рядом… Откройте кейс возле телефона или наденьте наушники." />}
       <Card>
         <View style={st.battRow}>
           <BatteryCell label="Левый" value={info?.left} charging={info?.leftCh} extra={ear(info?.leftInEar)} />
@@ -297,7 +253,7 @@ function AirPodsScreen({ bonded }: { bonded?: BondedDevice }) {
           <BatteryCell label="Кейс" value={info?.case} charging={info?.caseCh} />
         </View>
       </Card>
-      <Card title="Об устройстве">
+      <Card title="Об устройстве" index={5}>
         <Row title="Модель" right={<Text style={st.pickValue}>{info?.model ?? bonded?.name ?? '—'}</Text>} />
         <Row title="Сигнал" last right={<Text style={st.pickValue}>{info ? `${info.rssi} дБм` : '—'}</Text>} />
       </Card>
@@ -321,7 +277,12 @@ export default function App() {
     setReady(ok);
     if (ok) setDevices(BudsBt.bondedDevices());
   }, []);
-  useEffect(() => { init(); }, [init]);
+  useEffect(() => {
+    askPermissions().then((ok) => {
+      setReady(ok);
+      if (ok) setDevices(BudsBt.bondedDevices());
+    });
+  }, []);
 
   const cmfDev = devices.find((d) => d.name.toUpperCase().startsWith('CMF'));
   const podsDev = devices.find((d) => d.name.toUpperCase().includes('AIRPODS'));
@@ -346,11 +307,13 @@ export default function App() {
           <Segmented value={current} onChange={setTab}
             items={[['cmf', cmfDev?.name ?? 'CMF Buds'], ['airpods', podsDev?.name ?? 'AirPods']]} />
         </View>
+        <Animated.View key={current} entering={fadeSwap}>
         {current === 'cmf' ? (
           cmfDev ? <CmfScreen key={cmfDev.address} dev={cmfDev} /> : (
             <Card><Row title="CMF Buds не найдены" subtitle="Сначала подключите их в настройках Bluetooth телефона, потом нажмите здесь" last onPress={init} /></Card>
           )
         ) : <AirPodsScreen bonded={podsDev} />}
+        </Animated.View>
       </>
     );
   }
@@ -370,26 +333,12 @@ const st = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
   scroll: { padding: 16, paddingTop: 56, paddingBottom: 40 },
   h1: { color: C.text, fontSize: 32, fontWeight: '800', marginBottom: 16 },
-  card: { backgroundColor: C.card, borderRadius: 16, overflow: 'hidden' },
-  cardTitle: { color: C.sub, fontSize: 13, fontWeight: '600', textTransform: 'uppercase', marginBottom: 6, marginLeft: 4 },
   battRow: { flexDirection: 'row', padding: 16, gap: 12 },
-  battCell: { flex: 1, alignItems: 'center' },
-  battValue: { color: C.text, fontSize: 22, fontWeight: '700' },
-  battTrack: { height: 6, alignSelf: 'stretch', backgroundColor: C.line, borderRadius: 3, marginVertical: 8, overflow: 'hidden' },
-  battFill: { height: 6, borderRadius: 3 },
-  battLabel: { color: C.sub, fontSize: 13 },
-  battExtra: { color: C.green, fontSize: 12, marginTop: 2 },
-  seg: { flexDirection: 'row', backgroundColor: C.line, borderRadius: 10, padding: 3 },
-  segItem: { flex: 1, paddingVertical: 8, paddingHorizontal: 6, borderRadius: 8, alignItems: 'center', minWidth: 34 },
-  segActive: { backgroundColor: C.accent },
-  segText: { color: C.text, fontSize: 14 },
   row: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 13, minHeight: 52, gap: 12 },
   rowLine: { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.line },
   rowTitle: { color: C.text, fontSize: 16 },
   rowSub: { color: C.sub, fontSize: 13, marginTop: 2 },
   pickValue: { color: C.sub, fontSize: 15 },
-  banner: { backgroundColor: '#3A2A12', borderRadius: 14, padding: 14, marginBottom: 18 },
-  bannerText: { color: '#FFD9A0', fontSize: 14, lineHeight: 20 },
   backdrop: { flex: 1, backgroundColor: '#000a', justifyContent: 'flex-end' },
   sheet: { backgroundColor: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 16, paddingBottom: 32, maxHeight: '70%' },
   sheetTitle: { color: C.text, fontSize: 18, fontWeight: '700', marginBottom: 8 },
