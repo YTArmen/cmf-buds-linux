@@ -398,7 +398,8 @@ class EqGroup:
         Gtk.StyleContext.add_provider_for_display(page.get_display(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         g = Adw.PreferencesGroup(title="Эквалайзер",
-                                 description="Звук настраивается на компьютере перед отправкой в наушники")
+                                 description="Звук настраивается на компьютере перед отправкой в наушники. "
+                                             "Если выключить, звук станет ровным без переключений")
         self.switch = Adw.SwitchRow(title="Включить эквалайзер")
         g.add(self.switch)
         self.preset = Adw.ComboRow(title="Набор", model=Gtk.StringList.new([n for _, n, _ in buds_eq.PRESETS]))
@@ -442,8 +443,9 @@ class EqGroup:
 
     def _save(self):
         names = [k for k, _, _ in buds_eq.PRESETS]
+        used = self.eq.running or (self.cfg_get() or {}).get("used", False)
         self.cfg_set({"on": self.switch.get_active(), "preset": names[self.preset.get_selected()],
-                      "gains": self.gains})
+                      "gains": self.gains, "used": used})
 
     def _say(self, text):
         self.status.set_title(text or "")
@@ -464,8 +466,10 @@ class EqGroup:
                 self._save()
             else:
                 self._say("")
+                self._save()  # запомнить, что эквалайзер уже в цепочке
         else:
-            self.eq.stop()
+            # не убирать эквалайзер (это переключило бы звук) — просто сделать звук ровным
+            self._push([0] * 10)
 
     def on_preset(self, *_):
         gains = buds_eq.PRESETS[self.preset.get_selected()][2]
@@ -497,17 +501,22 @@ class EqGroup:
     def _flush(self):
         self.pending = None
         self._save()
-        gains = list(self.gains)
-        threading.Thread(target=self.eq.set_gains, args=(gains,), daemon=True).start()
+        if self.switch.get_active():
+            self._push(list(self.gains))
         return False
 
+    def _push(self, gains):
+        threading.Thread(target=self.eq.set_gains, args=(gains,), daemon=True).start()
+
     def connected(self, ok):
-        """Наушники подключились или пропали: эквалайзер включается и выключается вместе с ними."""
-        if not self.switch.get_active():
+        """Наушники подключились или пропали: эквалайзер встаёт в цепочку вместе с ними.
+        Если однажды включён — остаётся в цепочке, выключатель лишь делает звук ровным."""
+        cfg = self.cfg_get() or {}
+        if not (self.switch.get_active() or cfg.get("used")):
             return
         if ok and not self.eq.running:
             def later():
-                err = self.eq.start(self.gains)
+                err = self.eq.start(self.gains if self.switch.get_active() else [0] * 10)
                 GLib.idle_add(self._say, err)
             threading.Timer(2.0, later).start()  # дать системе поднять звук
         elif not ok and self.eq.running:
