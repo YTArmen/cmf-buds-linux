@@ -1203,10 +1203,17 @@ class Window(Adw.ApplicationWindow):
             act.connect("change-state", self.on_toggle_device, mac)
             self.add_action(act)
             section.append(name, "win.show-" + mac.replace(":", ""))
-        menu.append_section("Показывать наушники", section)
         if len(self.devices) > 1:
-            self.header.pack_end(Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=menu,
-                                                tooltip_text="Какие наушники показывать"))
+            menu.append_section("Показывать наушники", section)
+        other = Gio.Menu()
+        auto = Gio.SimpleAction.new_stateful("autostart", None, GLib.Variant.new_boolean(autostart_enabled()))
+        auto.connect("change-state", self.on_autostart)
+        self.add_action(auto)
+        other.append("Запускать вместе с системой", "win.autostart")
+        other.append("Выйти полностью", "app.quit")
+        menu.append_section(None, other)
+        self.header.pack_end(Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=menu,
+                                            tooltip_text="Меню"))
         self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         view.set_content(self.stack)
         self.apply_visibility(prefer_connected=True)
@@ -1264,10 +1271,18 @@ class Window(Adw.ApplicationWindow):
         self.apply_visibility()
 
     def do_close_request(self):
+        # окно прячется, программа работает в фоне (эквалайзер, пауза и т. д.)
+        self.set_visible(False)
+        return True
+
+    def shutdown_all(self):
         for _, page in getattr(self, "pages", {}).values():
             if getattr(page, "eqg", None):
                 page.eqg.shutdown()
-        return False
+
+    def on_autostart(self, action, value):
+        set_autostart(value.get_boolean())
+        action.set_state(GLib.Variant.new_boolean(autostart_enabled()))
 
     def on_refresh(self, *_):
         page = self.stack.get_visible_child()
@@ -1275,14 +1290,62 @@ class Window(Adw.ApplicationWindow):
             page.read_all()
 
 
+AUTOSTART = os.path.join(GLib.get_user_config_dir(), "autostart", "io.github.ytarmen.CmfBuds.desktop")
+
+
+def autostart_enabled():
+    return os.path.exists(AUTOSTART)
+
+
+def set_autostart(on):
+    if not on:
+        try:
+            os.remove(AUTOSTART)
+        except OSError:
+            pass
+        return
+    os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
+    with open(AUTOSTART, "w") as f:
+        f.write("[Desktop Entry]\nType=Application\nName=Наушники (в фоне)\n"
+                f"Exec=python3 {os.path.abspath(__file__)} --background\n"
+                "Icon=io.github.ytarmen.CmfBuds\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n")
+
+
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id="io.github.ytarmen.CmfBuds")
+        super().__init__(application_id="io.github.ytarmen.CmfBuds",
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+        self.held = False
+        quit_ = Gio.SimpleAction.new("quit", None)
+        quit_.connect("activate", self.on_quit)
+        self.add_action(quit_)
+
+    def do_command_line(self, cmd):
+        background = "--background" in cmd.get_arguments()[1:]
+        if not self.held:
+            self.hold()  # не завершаться, когда окно закрыто
+            self.held = True
+        if self.win is None:
+            self.win = Window(self)
+        if not background:
+            self.win.present()
+        return 0
 
     def do_activate(self):
-        win = self.get_active_window() or Window(self)
-        win.present()
+        if self.win is None:
+            self.win = Window(self)
+        self.win.present()
+
+    def on_quit(self, *_):
+        if self.win:
+            self.win.shutdown_all()
+            self.win.destroy()
+        if self.held:
+            self.release()
+            self.held = False
+        self.quit()
 
 
 if __name__ == "__main__":
-    sys.exit(App().run(sys.argv[:1]))
+    sys.exit(App().run(sys.argv))

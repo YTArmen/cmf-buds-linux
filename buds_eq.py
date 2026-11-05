@@ -175,6 +175,7 @@ context.modules = [
         if self.running:
             self.set_gains(gains)
             return None
+        self._kill_orphan()
         target = headphones_sink(self.mac)
         if not target:
             return "Наушники не выводят звук. Подключите их как аудиоустройство."
@@ -216,6 +217,23 @@ context.modules = [
         else:
             set_volume(self.name, 1.0)
         return None
+
+    def _kill_orphan(self):
+        """Эквалайзер, оставшийся от прошлого запуска (если программа упала), — убрать."""
+        objs = _dump()
+        clients = {o["id"]: (o.get("info") or {}).get("props") or {}
+                   for o in objs if o.get("type", "").endswith("Client")}
+        for o in objs:
+            p = (o.get("info") or {}).get("props") or {}
+            if o.get("type", "").endswith("Node") and p.get("node.name") == self.name:
+                try:
+                    c = clients.get(int(p.get("client.id", -1)), {})
+                    pid = int(c.get("application.process.id", 0) or p.get("application.process.id", 0) or 0)
+                    if pid and pid != os.getpid():
+                        os.kill(pid, 15)
+                        time.sleep(0.3)
+                except (ValueError, OSError):
+                    pass
 
     def set_gains(self, gains):
         if not self.running or self.node is None:
