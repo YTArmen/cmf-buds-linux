@@ -40,8 +40,10 @@ class BudsBtModule : Module() {
     Function("isEnabled") { adapter?.isEnabled == true }
 
     Function("bondedDevices") {
-      adapter?.bondedDevices?.map { mapOf("address" to it.address, "name" to (it.name ?: "")) }
+      val list: List<Map<String, String>> = adapter?.bondedDevices
+        ?.map { d: BluetoothDevice -> mapOf("address" to d.address, "name" to (d.name ?: "")) }
         ?: emptyList()
+      list
     }
 
     AsyncFunction("connectSpp") { address: String, uuid: String, channel: Int ->
