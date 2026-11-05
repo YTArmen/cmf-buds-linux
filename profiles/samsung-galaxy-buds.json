@@ -1,0 +1,75 @@
+{
+  "id": "samsung-galaxy-buds",
+  "version": 1,
+  "name": "Samsung Galaxy Buds",
+  "codec": "samsung",
+  "tested": false,
+  "source": "github.com/timschneeb/GalaxyBudsClient, Gadgetbridge",
+  "models": [
+    {
+      "match": "Buds3",
+      "uuid": "2e73a4ad-332d-41fc-90e2-16bef06523f2",
+      "modes": [
+        "off",
+        "anc",
+        "transparency",
+        "adaptive"
+      ]
+    },
+    {
+      "match": "Buds2",
+      "uuid": "2e73a4ad-332d-41fc-90e2-16bef06523f2",
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "Buds FE",
+      "uuid": "2e73a4ad-332d-41fc-90e2-16bef06523f2",
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "Buds Pro",
+      "uuid": "00001101-0000-1000-8000-00805f9b34fb",
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "Buds Live",
+      "uuid": "00001101-0000-1000-8000-00805f9b34fb",
+      "noise_variant": "live",
+      "modes": [
+        "off",
+        "anc"
+      ]
+    },
+    {
+      "match": "Buds+",
+      "uuid": "00001101-0000-1000-8000-00805f9b34fb",
+      "noise_variant": "ambient",
+      "modes": [
+        "off",
+        "transparency"
+      ]
+    },
+    {
+      "match": "Galaxy Buds",
+      "uuid": "00001102-0000-1000-8000-00805f9b34fd",
+      "legacy": true,
+      "noise_variant": "ambient",
+      "modes": [
+        "off",
+        "transparency"
+      ]
+    }
+  ]
+}

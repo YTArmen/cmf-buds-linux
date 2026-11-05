@@ -9,7 +9,9 @@ AirPods: Bluetooth L2CAP, PSM 0x1001, протокол Apple AAP (пакеты 0
 """
 import json
 import os
+import re
 import socket
+import urllib.request
 import subprocess
 import sys
 import threading
@@ -20,6 +22,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from buds_codecs import CODECS  # noqa: E402
 
 
 # --- поиск наушников -------------------------------------------------------
@@ -639,6 +644,223 @@ class AirPodsPage(DevicePage):
             self.link.set_control(ctl, 1 if row.get_active() else 2)
 
 
+# --- профили других марок -----------------------------------------------------
+PROFILES_URL = "https://raw.githubusercontent.com/YTArmen/cmf-buds-linux/main/profiles/"
+PROFILE_DIR = os.path.join(GLib.get_user_cache_dir(), "cmf-buds", "profiles")
+NOISE_LABELS = {"off": "Выкл", "anc": "Шумоподав.", "transparency": "Прозрачность", "adaptive": "Адаптивный"}
+
+
+def _fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "buds-control/1.1"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        raw = r.read(256 * 1024)
+    return json.loads(raw), len(raw)
+
+
+def valid_profile(p):
+    """Профиль — только данные: проверяем форму, код из сети не выполняется."""
+    try:
+        ok = (isinstance(p, dict) and p.get("codec") in CODECS and isinstance(p.get("models"), list)
+              and all(isinstance(m.get("match"), str) for m in p["models"]))
+        return ok and re.fullmatch(r"[a-z0-9-]{1,40}", p.get("id", "")) is not None
+    except AttributeError:
+        return False
+
+
+def local_profiles():
+    out = []
+    try:
+        names = os.listdir(PROFILE_DIR)
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(os.path.join(PROFILE_DIR, n)) as f:
+                p = json.load(f)
+            if valid_profile(p):
+                out.append(p)
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def match_model(profile, name):
+    for m in profile["models"]:
+        if m["match"].lower() in name.lower():
+            return m
+    return None
+
+
+def find_profile(name):
+    for p in local_profiles():
+        m = match_model(p, name)
+        if m:
+            return p, m
+    return None, None
+
+
+def find_remote_profile(name):
+    """Поискать профиль для этих наушников в списке на GitHub. Вернёт (запись, ссылку)."""
+    idx, _ = _fetch_json(PROFILES_URL + "index.json")
+    for e in idx.get("profiles", []):
+        if any(m.lower() in name.lower() for m in e.get("match", [])):
+            if re.fullmatch(r"[a-z0-9-]+\.json", e.get("file", "")):
+                return e, PROFILES_URL + e["file"]
+    return None, None
+
+
+def download_profile(url):
+    p, size = _fetch_json(url)
+    if not valid_profile(p):
+        raise ValueError("профиль повреждён или требует новую версию программы")
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    with open(os.path.join(PROFILE_DIR, p["id"] + ".json"), "w") as f:
+        json.dump(p, f, ensure_ascii=False, indent=2)
+    return p, size
+
+
+def find_channel(mac, uuids):
+    """Номер канала RFCOMM по коду службы (через sdptool, наушники должны быть включены)."""
+    try:
+        out = subprocess.run(["sdptool", "records", mac], capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return channel_from_sdp(out, uuids)
+
+
+def channel_from_sdp(out, uuids):
+    keys = []
+    for u in uuids:
+        u = u.lower()
+        keys.append(u)
+        if u.endswith("-0000-1000-8000-00805f9b34fb") and u.startswith("0000"):
+            keys.append(f"(0x{u[4:8]})")  # стандартные службы sdptool пишет коротким кодом
+    for rec in out.split("Service RecHandle")[1:]:
+        low = rec.lower()
+        if any(k in low for k in keys):
+            m = re.search(r"Channel:\s*(\d+)", rec)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+class ProfileLink(Link):
+    def __init__(self, mac, model, codec_cls, profile, on_change, on_state):
+        self.model, self.codec = model, None
+        self.codec_cls, self.profile = codec_cls, profile
+        self.channel = None
+        self.on_change = on_change
+        super().__init__(mac, lambda *_: None, on_state)
+
+    def open(self):
+        uuids = self.model.get("uuids") or [self.model["uuid"]]
+        if self.channel is None:
+            self.channel = find_channel(self.mac, uuids)
+        if self.channel is None:
+            raise OSError("не найден канал")
+        s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+        s.settimeout(6)
+        try:
+            s.connect((self.mac, self.channel))
+        except OSError:
+            self.channel = None  # в следующий раз поискать заново
+            s.close()
+            raise
+        s.settimeout(None)
+        cfg = dict(self.profile, **self.model)
+        self.codec = self.codec_cls(cfg, self._send_now(s))
+        self.codec.start()
+        return s
+
+    @staticmethod
+    def _send_now(s):
+        def send(data):
+            try:
+                s.send(data)
+            except OSError:
+                pass
+        return send
+
+    def read_forever(self, s):
+        while True:
+            data = s.recv(1024)
+            if not data:
+                raise OSError("closed")
+            changes = self.codec.feed(data)
+            if changes:
+                self.on_change(changes)
+
+
+class ProfilePage(DevicePage):
+    """Наушники другой марки по скачанному профилю."""
+
+    WAIT_TEXT = "Наушники не на связи. Достаньте их из кейса — подключусь сам."
+
+    def __init__(self, mac, name, profile, model):
+        super().__init__(mac)
+        self.batt = self.battery_group([("left", "Левый"), ("right", "Правый"), ("case", "Кейс")])
+        self.noise = None
+        modes = [m for m in model.get("modes", []) if m in NOISE_LABELS]
+        if modes:
+            g = Adw.PreferencesGroup(title="Шумоподавление")
+            self.noise = Adw.ToggleGroup(margin_bottom=8)
+            for m in modes:
+                self.noise.add(Adw.Toggle(name=m, label=NOISE_LABELS[m]))
+            self.noise.connect("notify::active-name", self.on_noise)
+            g.add(self.noise)
+            self.page.add(g)
+        g = Adw.PreferencesGroup(title="В ушах")
+        self.ear_row = Adw.ActionRow(title="Сейчас", subtitle="—")
+        g.add(self.ear_row)
+        self.page.add(g)
+        g = Adw.PreferencesGroup(title="Об устройстве")
+        g.add(Adw.ActionRow(title="Название", subtitle=name))
+        g.add(Adw.ActionRow(title="Профиль", subtitle=f"{profile.get('name', profile['id'])}, версия {profile.get('version', 1)}"))
+        g.add(Adw.ActionRow(title="Адрес Bluetooth", subtitle=mac))
+        if not profile.get("tested", True):
+            g.set_description("Этот профиль собран по описаниям из открытых проектов и ещё не проверен "
+                              "на настоящих наушниках. Если что-то не работает — напишите нам на GitHub.")
+        self.page.add(g)
+        self.set_controls_sensitive(False)
+        self.link = ProfileLink(mac, model, CODECS[profile["codec"]], profile,
+                                lambda ch: GLib.idle_add(self._changes, ch), self.state_from_thread)
+        GLib.timeout_add_seconds(30, self._poll)
+
+    def set_controls_sensitive(self, ok):
+        if self.noise:
+            self.noise.set_sensitive(ok)
+
+    def _poll(self):
+        if self.link.codec and self.link.sock:
+            self.link.codec.poll()
+        return True
+
+    def read_all(self):
+        self._poll()
+
+    def _changes(self, ch):
+        self.busy = True
+        try:
+            for k in ("left", "right", "case"):
+                if k in ch:
+                    row, bar = self.batt[k]
+                    charging = ch.get(k + "_ch")
+                    row.set_subtitle(f"{ch[k]}%" + (" · заряжается" if charging else ""))
+                    bar.set_value(ch[k])
+            if "noise" in ch and self.noise:
+                self.noise.set_active_name(ch["noise"])
+            if "ears" in ch:
+                self.ear_row.set_subtitle({"both": "Оба наушника в ушах", "one": "Один наушник в ухе",
+                                           "case": "В кейсе", "none": "Не в ушах"}[ch["ears"]])
+        finally:
+            self.busy = False
+        return False
+
+    def on_noise(self, *_):
+        if not self.busy and self.link.codec:
+            self.link.codec.set_noise(self.noise.get_active_name())
+
+
 class GenericPage(DevicePage):
     """Наушники без своего профиля: общий заряд из Bluetooth."""
 
@@ -655,9 +877,17 @@ class GenericPage(DevicePage):
         self.page.add(g)
         g = Adw.PreferencesGroup(
             title="Управление",
-            description="Для этих наушников пока нет профиля, поэтому видно только общий заряд. "
-                        "Профили разных марок добавляются в программу по мере готовности.")
+            description="Для этих наушников пока нет профиля, поэтому видно только общий заряд.")
+        self.support_row = Adw.ActionRow(title="Ищу поддержку на GitHub…")
+        self.support_btn = Gtk.Button(label="Скачать", valign=Gtk.Align.CENTER, visible=False,
+                                      css_classes=["suggested-action", "pill"])
+        self.support_btn.connect("clicked", self.on_download)
+        self.support_row.add_suffix(self.support_btn)
+        g.add(self.support_row)
         self.page.add(g)
+        self.name, self.remote_url = name, None
+        self.on_profile = None  # окно подставит: что делать после скачивания
+        threading.Thread(target=self._look_up, daemon=True).start()
         g = Adw.PreferencesGroup(title="Об устройстве")
         g.add(Adw.ActionRow(title="Название", subtitle=name))
         g.add(Adw.ActionRow(title="Адрес Bluetooth", subtitle=mac))
@@ -672,6 +902,45 @@ class GenericPage(DevicePage):
 
     def set_controls_sensitive(self, ok):
         pass
+
+    def _look_up(self):
+        try:
+            entry, url = find_remote_profile(self.name)
+        except Exception:  # нет интернета и т. п.
+            GLib.idle_add(self.support_row.set_title, "Не удалось проверить: нет связи с GitHub")
+            return
+        if entry:
+            self.remote_url = url
+            GLib.idle_add(self._offer, entry)
+        else:
+            GLib.idle_add(self.support_row.set_title, "Для этих наушников поддержки пока нет")
+
+    def _offer(self, entry):
+        self.support_row.set_title(f"Есть поддержка: {entry.get('name', entry['id'])}")
+        self.support_row.set_subtitle("Профиль — несколько килобайт, скачивается с GitHub")
+        self.support_btn.set_visible(True)
+        return False
+
+    def on_download(self, *_):
+        self.support_btn.set_sensitive(False)
+        self.support_btn.set_label("Скачиваю…")
+
+        def work():
+            try:
+                p, size = download_profile(self.remote_url)
+                GLib.idle_add(self._done, p, size, None)
+            except Exception as e:
+                GLib.idle_add(self._done, None, 0, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self, profile, size, err):
+        if err:
+            self.support_row.set_subtitle(f"Ошибка: {err}")
+            self.support_btn.set_label("Ещё раз")
+            self.support_btn.set_sensitive(True)
+        elif self.on_profile:
+            self.on_profile(self.mac, profile)
+        return False
 
     def read_all(self):
         if not self.enabled:
@@ -746,8 +1015,7 @@ class Window(Adw.ApplicationWindow):
                 page = CmfPage(mac)
                 icon = "audio-headphones-symbolic"
             elif kind == "generic":
-                page = GenericPage(mac, name)
-                icon = "audio-headphones-symbolic"
+                page, icon = self.make_generic(mac, name), "audio-headphones-symbolic"
             else:
                 page = AirPodsPage(mac, AIRPODS_MODEL_OF.get(mac, name))
                 icon = "audio-headset-symbolic"
@@ -764,6 +1032,29 @@ class Window(Adw.ApplicationWindow):
         self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         view.set_content(self.stack)
         self.apply_visibility(prefer_connected=True)
+
+    def make_generic(self, mac, name):
+        profile, model = find_profile(name)
+        if profile:
+            return ProfilePage(mac, name, profile, model)
+        page = GenericPage(mac, name)
+        page.on_profile = self.replace_with_profile
+        return page
+
+    def replace_with_profile(self, mac, profile):
+        """Профиль скачан — заменить вкладку на полноценную, без перезапуска."""
+        name = next(n for _, m, n in self.devices if m == mac)
+        model = match_model(profile, name)
+        if not model:
+            return
+        old_sp, old = self.pages[mac]
+        old.link.set_enabled(False)
+        page = ProfilePage(mac, name, profile, model)
+        self.stack.remove(old)
+        sp = self.stack.add_titled_with_icon(page, mac, name, "audio-headphones-symbolic")
+        self.pages[mac] = (sp, page)
+        self.apply_visibility()
+        self.stack.set_visible_child_name(mac)
 
     def apply_visibility(self, prefer_connected=False):
         visible = [d for d in self.devices if d[1] not in self.hidden] or self.devices[:1]

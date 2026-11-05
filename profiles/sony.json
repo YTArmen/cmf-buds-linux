@@ -1,0 +1,150 @@
+{
+  "id": "sony",
+  "version": 1,
+  "name": "Sony WH / WF / LinkBuds",
+  "codec": "sony",
+  "tested": false,
+  "source": "Gadgetbridge (service/devices/sony/headphones)",
+  "models": [
+    {
+      "match": "WH-1000XM",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "WF-1000XM",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "WF-SP800N",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "WH-CH720N",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "WF-C700N",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "WF-C710N",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "LinkBuds",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "ULT WEAR",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "Sony ULT",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": [
+        "off",
+        "anc",
+        "transparency"
+      ]
+    },
+    {
+      "match": "WF-C500",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": []
+    },
+    {
+      "match": "WF-C510",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": []
+    },
+    {
+      "match": "WI-C100",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": []
+    },
+    {
+      "match": "WI-SP600N",
+      "uuids": [
+        "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+        "96cc203e-5068-46ad-b32d-e316f5e069ba"
+      ],
+      "modes": []
+    }
+  ]
+}

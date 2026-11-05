@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "base": "https://raw.githubusercontent.com/YTArmen/cmf-buds-linux/main/profiles/",
+  "profiles": [
+    {
+      "id": "samsung-galaxy-buds",
+      "version": 1,
+      "name": "Samsung Galaxy Buds",
+      "file": "samsung-galaxy-buds.json",
+      "codec": "samsung",
+      "match": [
+        "Buds3",
+        "Buds2",
+        "Buds FE",
+        "Buds Pro",
+        "Buds Live",
+        "Buds+",
+        "Galaxy Buds"
+      ]
+    },
+    {
+      "id": "sony",
+      "version": 1,
+      "name": "Sony WH / WF / LinkBuds",
+      "file": "sony.json",
+      "codec": "sony",
+      "match": [
+        "WH-1000XM",
+        "WF-1000XM",
+        "WF-SP800N",
+        "WH-CH720N",
+        "WF-C700N",
+        "WF-C710N",
+        "LinkBuds",
+        "ULT WEAR",
+        "Sony ULT",
+        "WF-C500",
+        "WF-C510",
+        "WI-C100",
+        "WI-SP600N"
+      ]
+    }
+  ],
+  "planned": [
+    {
+      "name": "Xiaomi / Redmi Buds",
+      "note": "нужна проверка подлинности (SAFER+), в работе"
+    }
+  ]
+}
