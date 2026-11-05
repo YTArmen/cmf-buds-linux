@@ -17,11 +17,11 @@ install -m 755 "$DIR/cmf_buds.py" "$APP_DIR/cmf_buds.py"
 cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
-Name=CMF Buds
-Comment=Настройки наушников CMF Buds
+Name=Наушники (CMF Buds, AirPods)
+Comment=Настройки наушников CMF Buds и AirPods
 Exec=python3 $APP_DIR/cmf_buds.py
 Icon=audio-headphones
 Categories=AudioVideo;Settings;
 EOF
 
-echo "Готово. Откройте «CMF Buds» в меню приложений."
+echo "Готово. Откройте «Наушники» в меню приложений."

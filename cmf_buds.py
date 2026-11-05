@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""CMF Buds — мини-программа настроек наушников (как приложение Nothing X).
+"""Настройки наушников для Linux: CMF Buds и AirPods.
 
-Связь: Bluetooth RFCOMM, канал 15, протокол Nothing (пакеты 55 60 01 ... + CRC16).
+CMF Buds: Bluetooth RFCOMM, канал 15, протокол Nothing (пакеты 55 60 01 ... + CRC16).
 Проверено 03.11.2026 на CMF Buds, прошивка 1.0.5.050.
-Неофициальная программа, не связана с Nothing Technology.
+AirPods: Bluetooth L2CAP, PSM 0x1001, протокол Apple AAP (пакеты 04 00 04 00 ...).
+Проверено 05.11.2026 на AirPods Pro 2.
+Неофициальная программа, не связана с Nothing Technology и Apple.
 """
 import os
 import socket
@@ -16,32 +18,109 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
-
-CHANNEL = 15
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 
-def find_mac():
-    """Адрес наушников: аргумент, переменная CMF_BUDS_MAC или поиск по имени в bluetoothctl."""
-    if len(sys.argv) > 1 and sys.argv[1].count(":") == 5:
-        return sys.argv[1].upper()
-    if os.environ.get("CMF_BUDS_MAC"):
-        return os.environ["CMF_BUDS_MAC"].upper()
+# --- поиск наушников -------------------------------------------------------
+def _bt(*args):
     try:
-        out = subprocess.run(["bluetoothctl", "devices", "Paired"], capture_output=True,
-                             text=True, timeout=5).stdout
+        return subprocess.run(["bluetoothctl", *args], capture_output=True,
+                              text=True, timeout=5).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    for line in out.splitlines():
+        return ""
+
+
+AIRPODS_MODELS = {0x2002: "AirPods", 0x200F: "AirPods 2", 0x2013: "AirPods 3",
+                  0x200E: "AirPods Pro", 0x2014: "AirPods Pro 2",
+                  0x2024: "AirPods Pro 2 (USB-C)", 0x200A: "AirPods Max",
+                  0x2019: "AirPods 4", 0x201B: "AirPods 4 (шумоподавление)"}
+
+
+def find_devices():
+    """Список (вид, адрес, название) сопряжённых наушников: 'cmf' или 'airpods'.
+
+    Адрес CMF можно задать аргументом или переменной CMF_BUDS_MAC, AirPods — AIRPODS_MAC.
+    """
+    found = []
+    cmf_mac = os.environ.get("CMF_BUDS_MAC")
+    if len(sys.argv) > 1 and sys.argv[1].count(":") == 5:
+        cmf_mac = sys.argv[1]
+    if cmf_mac:
+        found.append(("cmf", cmf_mac.upper(), "CMF Buds"))
+    if os.environ.get("AIRPODS_MAC"):
+        found.append(("airpods", os.environ["AIRPODS_MAC"].upper(), "AirPods"))
+    for line in _bt("devices", "Paired").splitlines():
         parts = line.split(" ", 2)
-        if len(parts) == 3 and parts[2].strip().upper().startswith("CMF BUDS"):
-            return parts[1]
-    return None
+        if len(parts) != 3 or any(mac == parts[1] for _, mac, _ in found):
+            continue
+        mac, name = parts[1], parts[2].strip()
+        if name.upper().startswith("CMF BUDS") and not cmf_mac:
+            found.append(("cmf", mac, name))
+            continue
+        info = _bt("info", mac)
+        if "Modalias: bluetooth:v004C" in info or "AIRPODS" in name.upper():
+            model = name
+            for ln in info.splitlines():
+                if "Modalias: bluetooth:v004Cp" in ln:
+                    pid = int(ln.split("v004Cp")[1][:4], 16)
+                    model = AIRPODS_MODELS.get(pid, name)
+            if "AIRPODS" in model.upper() or "AIRPODS" in name.upper():
+                found.append(("airpods", mac, model))
+    return found
 
 
-MAC = find_mac()
+def is_connected(mac):
+    return "Connected: yes" in _bt("info", mac)
 
-# --- команды -------------------------------------------------------------
+
+# --- общее: фоновое соединение ---------------------------------------------
+class Link:
+    """Держит соединение в фоне и переподключается. Ответы отдаются в on_packet."""
+
+    def __init__(self, mac, on_packet, on_state):
+        self.mac, self.on_packet, self.on_state = mac, on_packet, on_state
+        self.sock = None
+        self.lock = threading.Lock()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def send_raw(self, data):
+        with self.lock:
+            if not self.sock:
+                return False
+            try:
+                self.sock.send(data)
+                return True
+            except OSError:
+                return False
+
+    def _loop(self):
+        while True:
+            # Ждём, пока наушники подключит сама система. Если подключиться первыми,
+            # система решит, что связь уже есть, и не включит звук (A2DP).
+            if not is_connected(self.mac):
+                time.sleep(3)
+                continue
+            time.sleep(2)  # дать системе подключить звук
+            try:
+                s = self.open()
+                with self.lock:
+                    self.sock = s
+                self.on_state(True)
+                self.read_forever(s)
+            except OSError:
+                pass
+            with self.lock:
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except OSError:
+                        pass
+                self.sock = None
+            self.on_state(False)
+            time.sleep(4)
+
+
+# --- CMF Buds (протокол Nothing) -------------------------------------------
 READ_BATTERY, READ_ANC, READ_EQ = 0xC007, 0xC01E, 0xC01F
 READ_GESTURES, READ_LOWLAT, READ_FW, READ_BASS = 0xC018, 0xC041, 0xC042, 0xC04E
 SET_GESTURE, SET_ANC, SET_EQ, SET_LOWLAT, SET_BASS = 0xF003, 0xF00F, 0xF010, 0xF040, 0xF051
@@ -77,56 +156,26 @@ def make_packet(cmd, payload=b""):
     return head + bytes([c & 0xFF, c >> 8])
 
 
-class Buds:
-    """Соединение с наушниками в фоне, ответы отдаются в on_packet(cmd, payload)."""
-
-    def __init__(self, on_packet, on_state):
-        self.on_packet, self.on_state = on_packet, on_state
-        self.sock = None
-        self.lock = threading.Lock()
-        threading.Thread(target=self._loop, daemon=True).start()
+class CmfLink(Link):
+    CHANNEL = 15
 
     def send(self, cmd, payload=b""):
-        with self.lock:
-            if not self.sock:
-                return False
-            try:
-                self.sock.send(make_packet(cmd, payload))
-                return True
-            except OSError:
-                return False
+        return self.send_raw(make_packet(cmd, payload))
 
-    def _loop(self):
-        if not MAC:
-            self.on_state(None)
-            return
+    def open(self):
+        s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+        s.settimeout(5)
+        s.connect((self.mac, self.CHANNEL))
+        s.settimeout(None)
+        return s
+
+    def read_forever(self, s):
+        buf = b""
         while True:
-            try:
-                s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-                s.settimeout(5)
-                s.connect((MAC, CHANNEL))
-                s.settimeout(None)
-                with self.lock:
-                    self.sock = s
-                self.on_state(True)
-                buf = b""
-                while True:
-                    data = s.recv(1024)
-                    if not data:
-                        raise OSError("closed")
-                    buf += data
-                    buf = self._parse(buf)
-            except OSError:
-                pass
-            with self.lock:
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except OSError:
-                        pass
-                self.sock = None
-            self.on_state(False)
-            time.sleep(4)
+            data = s.recv(1024)
+            if not data:
+                raise OSError("closed")
+            buf = self._parse(buf + data)
 
     def _parse(self, buf):
         while True:
@@ -148,39 +197,120 @@ class Buds:
             buf = buf[total:]
 
 
-class Window(Adw.ApplicationWindow):
-    def __init__(self, app):
-        super().__init__(application=app, title="CMF Buds")
-        self.set_default_size(440, 760)
+# --- AirPods (протокол Apple AAP) ------------------------------------------
+AAP_HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
+AAP_FEATURES = bytes.fromhex("040004004d00d700000000000000")
+AAP_NOTIFY = bytes.fromhex("040004000f00ffffffff")
+AAP_HEADER = b"\x04\x00\x04\x00"
+OP_BATTERY, OP_EAR, OP_CONTROL = 0x04, 0x06, 0x09
+CTL_NOISE, CTL_ONE_BUD_ANC, CTL_CONVERSATION = 0x0D, 0x1B, 0x28
+NOISE_MODES = [("off", 1, "Выкл"), ("anc", 2, "Шумоподав."),
+               ("transp", 3, "Прозрачность"), ("adaptive", 4, "Адаптивный")]
+EAR_IN, EAR_OUT, EAR_CASE = 0, 1, 2
+
+
+class AirPodsLink(Link):
+    PSM = 0x1001
+
+    def set_control(self, ctl, value):
+        return self.send_raw(AAP_HEADER + bytes([OP_CONTROL, 0, ctl, value, 0, 0, 0]))
+
+    def open(self):
+        s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+        s.settimeout(5)
+        s.connect((self.mac, self.PSM))
+        s.send(AAP_HANDSHAKE)
+        s.recv(1024)  # ответ на рукопожатие
+        s.send(AAP_FEATURES)
+        s.send(AAP_NOTIFY)
+        s.settimeout(None)
+        return s
+
+    def read_forever(self, s):
+        while True:
+            data = s.recv(1024)
+            if not data:
+                raise OSError("closed")
+            if data.startswith(AAP_HEADER) and len(data) >= 6:
+                self.on_packet(data[4] | (data[5] << 8), data[6:])
+
+
+def pause_media():
+    """Поставить на паузу все плееры (MPRIS через D-Bus), без лишних программ."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        names = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                              "org.freedesktop.DBus", "ListNames", None, None,
+                              Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        for name in names:
+            if name.startswith("org.mpris.MediaPlayer2."):
+                bus.call(name, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player",
+                         "Pause", None, None, Gio.DBusCallFlags.NONE, 2000, None, None)
+    except GLib.Error:
+        pass
+
+
+# --- страницы окна ---------------------------------------------------------
+class DevicePage(Gtk.Box):
+    """Общее для страниц: баннер о связи + список настроек."""
+
+    WAIT_TEXT = "Наушники не на связи. Достаньте их из кейса — подключусь сам."
+
+    def __init__(self, mac):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.mac = mac
         self.busy = False  # не слать команды, пока заполняем поля из ответа
-
-        view = Adw.ToolbarView()
-        header = Adw.HeaderBar()
-        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Обновить")
-        refresh.connect("clicked", lambda *_: self.read_all())
-        header.pack_end(refresh)
-        view.add_top_bar(header)
-
         self.banner = Adw.Banner(title="Подключаюсь к наушникам…", revealed=True)
-        view.add_top_bar(self.banner)
+        self.append(self.banner)
+        self.page = Adw.PreferencesPage(vexpand=True)
+        self.append(self.page)
 
-        page = Adw.PreferencesPage()
-        view.set_content(page)
-        self.set_content(view)
-
-        # Заряд
+    def battery_group(self, items):
         g = Adw.PreferencesGroup(title="Заряд")
-        self.batt = {}
-        for dev, name in [(2, "Левый"), (3, "Правый"), (4, "Кейс")]:
+        rows = {}
+        for key, name in items:
             row = Adw.ActionRow(title=name, subtitle="—")
             bar = Gtk.LevelBar(min_value=0, max_value=100, hexpand=True,
                                valign=Gtk.Align.CENTER, width_request=140)
             row.add_suffix(bar)
             g.add(row)
-            self.batt[dev] = (row, bar)
-        page.add(g)
+            rows[key] = (row, bar)
+        self.page.add(g)
+        return rows
 
-        # Шумоподавление
+    def state_from_thread(self, ok):
+        GLib.idle_add(self.on_state, ok)
+
+    def packet_from_thread(self, cmd, payload):
+        GLib.idle_add(self._packet, cmd, payload)
+
+    def _packet(self, cmd, payload):
+        self.busy = True
+        try:
+            self.on_packet(cmd, payload)
+        finally:
+            self.busy = False
+        return False
+
+    def on_state(self, ok):
+        self.set_controls_sensitive(ok)
+        self.banner.set_revealed(not ok)
+        if ok:
+            self.read_all()
+        else:
+            self.banner.set_title(self.WAIT_TEXT)
+        return False
+
+    def read_all(self):
+        pass
+
+
+class CmfPage(DevicePage):
+    def __init__(self, mac):
+        super().__init__(mac)
+        page = self.page
+        self.batt = self.battery_group([(2, "Левый"), (3, "Правый"), (4, "Кейс")])
+
         g = Adw.PreferencesGroup(title="Шумоподавление")
         self.anc_group = Adw.ToggleGroup(margin_bottom=8)
         for name, label in [("off", "Выкл"), ("transp", "Прозрачность"), ("anc", "Шумоподавление")]:
@@ -193,7 +323,6 @@ class Window(Adw.ApplicationWindow):
         g.add(self.anc_level)
         page.add(g)
 
-        # Звук
         g = Adw.PreferencesGroup(title="Звук")
         self.eq = Adw.ComboRow(title="Эквалайзер",
                                model=Gtk.StringList.new([n for _, n in EQ_PRESETS]))
@@ -212,7 +341,6 @@ class Window(Adw.ApplicationWindow):
         g.add(self.lowlat)
         page.add(g)
 
-        # Жесты
         self.gest = {}
         for side, side_name in SIDES:
             g = Adw.PreferencesGroup(title=f"Жесты — {side_name.lower()}")
@@ -224,35 +352,15 @@ class Window(Adw.ApplicationWindow):
                 self.gest[(side, gtype)] = row
             page.add(g)
 
-        # Об устройстве
         g = Adw.PreferencesGroup(title="Об устройстве")
         self.fw = Adw.ActionRow(title="Прошивка", subtitle="—")
         g.add(self.fw)
-        g.add(Adw.ActionRow(title="Адрес Bluetooth", subtitle=MAC or "—"))
+        g.add(Adw.ActionRow(title="Адрес Bluetooth", subtitle=mac))
         page.add(g)
 
         self.set_controls_sensitive(False)
-        self.buds = Buds(self.packet_from_thread, self.state_from_thread)
+        self.link = CmfLink(mac, self.packet_from_thread, self.state_from_thread)
         GLib.timeout_add_seconds(30, self.poll_battery)
-
-    # --- связь ------------------------------------------------------------
-    def state_from_thread(self, ok):
-        GLib.idle_add(self.on_state, ok)
-
-    def packet_from_thread(self, cmd, payload):
-        GLib.idle_add(self.on_packet, cmd, payload)
-
-    def on_state(self, ok):
-        self.set_controls_sensitive(ok)
-        if ok:
-            self.banner.set_revealed(False)
-            self.read_all()
-        elif ok is None:
-            self.banner.set_title("CMF Buds не найдены. Сначала подключите их в настройках Bluetooth.")
-            self.banner.set_revealed(True)
-        else:
-            self.banner.set_title("Наушники не на связи. Достаньте их из кейса — подключусь сам.")
-            self.banner.set_revealed(True)
 
     def set_controls_sensitive(self, ok):
         for w in [self.anc_group, self.anc_level, self.eq, self.bass, self.bass_level,
@@ -261,49 +369,44 @@ class Window(Adw.ApplicationWindow):
 
     def read_all(self):
         for c in [READ_BATTERY, READ_ANC, READ_EQ, READ_BASS, READ_LOWLAT, READ_GESTURES, READ_FW]:
-            self.buds.send(c)
+            self.link.send(c)
 
     def poll_battery(self):
-        self.buds.send(READ_BATTERY)
+        self.link.send(READ_BATTERY)
         return True
 
     def on_packet(self, cmd, p):
-        self.busy = True
-        try:
-            if cmd in (0x4007, 0xE001) and p:  # заряд
-                for i in range(p[0]):
-                    dev, lvl = p[1 + i * 2], p[2 + i * 2]
-                    if dev in self.batt:
-                        row, bar = self.batt[dev]
-                        pct = lvl & 0x7F
-                        row.set_subtitle(f"{pct}%" + (" · заряжается" if lvl & 0x80 else ""))
-                        bar.set_value(pct)
-            elif cmd == 0x401E and len(p) >= 5:
-                self.show_anc(p[4])
-            elif cmd == 0xE003 and len(p) >= 2:  # сменили жестом на наушнике
-                self.show_anc(p[1])
-            elif cmd == 0x401F and p:
-                idx = next((i for i, (v, _) in enumerate(EQ_PRESETS) if v == p[0]), None)
-                if idx is not None:
-                    self.eq.set_selected(idx)
-            elif cmd == 0x404E and len(p) >= 2:
-                self.bass.set_active(p[0] == 1)
-                self.bass_level.set_value(max(1, min(5, p[1] // 2)))
-                self.bass_level.set_sensitive(p[0] == 1)
-            elif cmd in (0x4041, 0xE005) and p:
-                self.lowlat.set_active(p[0] == 1)
-            elif cmd == 0x4042:
-                self.fw.set_subtitle(p.decode(errors="replace"))
-            elif cmd == 0x4018 and p:
-                for i in range(p[0]):
-                    side, _, gtype, act = p[1 + i * 4: 5 + i * 4]
-                    row = self.gest.get((side, gtype))
-                    idx = next((j for j, (v, _) in enumerate(ACTIONS) if v == act), None)
-                    if row and idx is not None:
-                        row.set_selected(idx)
-        finally:
-            self.busy = False
-        return False
+        if cmd in (0x4007, 0xE001) and p:  # заряд
+            for i in range(p[0]):
+                dev, lvl = p[1 + i * 2], p[2 + i * 2]
+                if dev in self.batt:
+                    row, bar = self.batt[dev]
+                    pct = lvl & 0x7F
+                    row.set_subtitle(f"{pct}%" + (" · заряжается" if lvl & 0x80 else ""))
+                    bar.set_value(pct)
+        elif cmd == 0x401E and len(p) >= 5:
+            self.show_anc(p[4])
+        elif cmd == 0xE003 and len(p) >= 2:  # сменили жестом на наушнике
+            self.show_anc(p[1])
+        elif cmd == 0x401F and p:
+            idx = next((i for i, (v, _) in enumerate(EQ_PRESETS) if v == p[0]), None)
+            if idx is not None:
+                self.eq.set_selected(idx)
+        elif cmd == 0x404E and len(p) >= 2:
+            self.bass.set_active(p[0] == 1)
+            self.bass_level.set_value(max(1, min(5, p[1] // 2)))
+            self.bass_level.set_sensitive(p[0] == 1)
+        elif cmd in (0x4041, 0xE005) and p:
+            self.lowlat.set_active(p[0] == 1)
+        elif cmd == 0x4042:
+            self.fw.set_subtitle(p.decode(errors="replace"))
+        elif cmd == 0x4018 and p:
+            for i in range(p[0]):
+                side, _, gtype, act = p[1 + i * 4: 5 + i * 4]
+                row = self.gest.get((side, gtype))
+                idx = next((j for j, (v, _) in enumerate(ACTIONS) if v == act), None)
+                if row and idx is not None:
+                    row.set_selected(idx)
 
     def show_anc(self, level):
         if level == ANC_OFF:
@@ -316,7 +419,6 @@ class Window(Adw.ApplicationWindow):
             self.anc_level.set_selected(idx)
         self.anc_level.set_visible(self.anc_group.get_active_name() == "anc")
 
-    # --- действия пользователя ----------------------------------------------
     def on_anc_mode(self, *_):
         mode = self.anc_group.get_active_name()
         self.anc_level.set_visible(mode == "anc")
@@ -325,26 +427,181 @@ class Window(Adw.ApplicationWindow):
         level = {"off": ANC_OFF, "transp": ANC_TRANSP}.get(mode)
         if level is None:
             level = ANC_LEVELS[self.anc_level.get_selected()][0]
-        self.buds.send(SET_ANC, bytes([1, level, 0]))
+        self.link.send(SET_ANC, bytes([1, level, 0]))
 
     def on_eq(self, *_):
         if not self.busy:
-            self.buds.send(SET_EQ, bytes([EQ_PRESETS[self.eq.get_selected()][0], 0]))
+            self.link.send(SET_EQ, bytes([EQ_PRESETS[self.eq.get_selected()][0], 0]))
 
     def on_bass(self, *_):
         on = self.bass.get_active()
         self.bass_level.set_sensitive(on)
         if not self.busy:
-            self.buds.send(SET_BASS, bytes([1 if on else 0, int(self.bass_level.get_value()) * 2]))
+            self.link.send(SET_BASS, bytes([1 if on else 0, int(self.bass_level.get_value()) * 2]))
 
     def on_lowlat(self, *_):
         if not self.busy:
-            self.buds.send(SET_LOWLAT, bytes([1 if self.lowlat.get_active() else 2, 0]))
+            self.link.send(SET_LOWLAT, bytes([1 if self.lowlat.get_active() else 2, 0]))
 
     def on_gesture(self, row, _pspec, side, gtype):
         if not self.busy:
             act = ACTIONS[row.get_selected()][0]
-            self.buds.send(SET_GESTURE, bytes([1, side, 1, gtype, act]))
+            self.link.send(SET_GESTURE, bytes([1, side, 1, gtype, act]))
+
+
+class AirPodsPage(DevicePage):
+    WAIT_TEXT = "AirPods не на связи. Откройте кейс или наденьте наушники — подключусь сам."
+
+    def __init__(self, mac, model):
+        super().__init__(mac)
+        page = self.page
+        self.ears = (None, None)
+        # 0x04 = левый, 0x02 = правый, 0x08 = кейс
+        self.batt = self.battery_group([(0x04, "Левый"), (0x02, "Правый"), (0x08, "Кейс")])
+
+        # шумоподавление есть только у Pro, Max и AirPods 4 с шумоподавлением;
+        # адаптивный режим — у Pro 2 и AirPods 4 с шумоподавлением
+        has_anc = any(w in model for w in ("Pro", "Max", "шумоподав"))
+        has_adaptive = "Pro 2" in model or "шумоподав" in model
+        g = Adw.PreferencesGroup(title="Шумоподавление", visible=has_anc)
+        self.noise = Adw.ToggleGroup(margin_bottom=8)
+        for name, _, label in NOISE_MODES:
+            if name != "adaptive" or has_adaptive:
+                self.noise.add(Adw.Toggle(name=name, label=label))
+        self.noise.connect("notify::active-name", self.on_noise)
+        g.add(self.noise)
+        self.conversation = Adw.SwitchRow(
+            title="Адаптация к разговору",
+            subtitle="Когда вы заговорите, музыка станет тише")
+        self.conversation.connect("notify::active", self.on_switch, CTL_CONVERSATION)
+        g.add(self.conversation)
+        self.one_bud = Adw.SwitchRow(
+            title="Шумоподавление с одним наушником",
+            subtitle="Работает, даже если в ухе только один AirPod")
+        self.one_bud.connect("notify::active", self.on_switch, CTL_ONE_BUD_ANC)
+        g.add(self.one_bud)
+        page.add(g)
+
+        g = Adw.PreferencesGroup(title="В ушах")
+        self.ear_row = Adw.ActionRow(title="Сейчас", subtitle="—")
+        g.add(self.ear_row)
+        self.autopause = Adw.SwitchRow(title="Пауза, когда вынимаете наушник",
+                                       subtitle="Музыка и видео на компьютере встанут на паузу",
+                                       active=True)
+        g.add(self.autopause)
+        page.add(g)
+
+        g = Adw.PreferencesGroup(title="Об устройстве")
+        g.add(Adw.ActionRow(title="Модель", subtitle=model))
+        g.add(Adw.ActionRow(title="Адрес Bluetooth", subtitle=mac))
+        page.add(g)
+
+        self.set_controls_sensitive(False)
+        self.link = AirPodsLink(mac, self.packet_from_thread, self.state_from_thread)
+
+    def set_controls_sensitive(self, ok):
+        for w in [self.noise, self.conversation, self.one_bud, self.autopause]:
+            w.set_sensitive(ok)
+
+    def read_all(self):
+        self.link.send_raw(AAP_NOTIFY)  # AirPods снова пришлют заряд и настройки
+
+    def on_packet(self, op, p):
+        if op == OP_BATTERY and p:
+            for i in range(p[0]):
+                part = p[1 + i * 5: 6 + i * 5]
+                if len(part) < 5 or part[0] not in self.batt:
+                    continue
+                row, bar = self.batt[part[0]]
+                level, status = part[2], part[3]
+                if status == 4:  # не на связи (например, наушник в другом кейсе)
+                    row.set_subtitle("нет связи")
+                    bar.set_value(0)
+                else:
+                    row.set_subtitle(f"{level}%" + (" · заряжается" if status == 1 else ""))
+                    bar.set_value(level)
+        elif op == OP_CONTROL and len(p) >= 2:
+            ctl, val = p[0], p[1]
+            if ctl == CTL_NOISE:
+                name = next((n for n, v, _ in NOISE_MODES if v == val), None)
+                if name:
+                    self.noise.set_active_name(name)
+            elif ctl == CTL_CONVERSATION:
+                self.conversation.set_active(val == 1)
+            elif ctl == CTL_ONE_BUD_ANC:
+                self.one_bud.set_active(val == 1)
+        elif op == OP_EAR and len(p) >= 2:
+            self.show_ears(p[0], p[1])
+
+    def show_ears(self, a, b):
+        in_ear = [a, b].count(EAR_IN)
+        text = {2: "Оба наушника в ушах", 1: "Один наушник в ухе"}.get(in_ear)
+        if not text:
+            text = "Оба в кейсе" if a == b == EAR_CASE else "Не в ушах"
+        self.ear_row.set_subtitle(text)
+        before = [x for x in self.ears if x is not None].count(EAR_IN)
+        if self.ears != (None, None) and in_ear < before and self.autopause.get_active():
+            pause_media()
+        self.ears = (a, b)
+
+    def on_noise(self, *_):
+        if self.busy:
+            return
+        val = next((v for n, v, _ in NOISE_MODES if n == self.noise.get_active_name()), None)
+        if val:
+            self.link.set_control(CTL_NOISE, val)
+
+    def on_switch(self, row, _pspec, ctl):
+        if not self.busy:
+            self.link.set_control(ctl, 1 if row.get_active() else 2)
+
+
+# --- окно ------------------------------------------------------------------
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Наушники")
+        self.set_default_size(460, 780)
+
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Обновить")
+        refresh.connect("clicked", self.on_refresh)
+        header.pack_end(refresh)
+        view.add_top_bar(header)
+        self.set_content(view)
+
+        self.stack = Adw.ViewStack()
+        devices = find_devices()
+        if not devices:
+            view.set_content(Adw.StatusPage(
+                icon_name="audio-headphones-symbolic", title="Наушники не найдены",
+                description="Сначала подключите CMF Buds или AirPods в настройках Bluetooth, "
+                            "потом откройте программу снова."))
+            return
+        for kind, mac, name in devices:
+            if kind == "cmf":
+                page = CmfPage(mac)
+                icon = "audio-headphones-symbolic"
+            else:
+                page = AirPodsPage(mac, name)
+                icon = "audio-headset-symbolic"
+            self.stack.add_titled_with_icon(page, mac, name, icon)
+        # первыми показать те наушники, что сейчас подключены
+        for kind, mac, _ in devices:
+            if is_connected(mac):
+                self.stack.set_visible_child_name(mac)
+                break
+        if len(devices) > 1:
+            header.set_title_widget(Adw.ViewSwitcher(stack=self.stack,
+                                                     policy=Adw.ViewSwitcherPolicy.WIDE))
+        else:
+            self.set_title(devices[0][2])
+        view.set_content(self.stack)
+
+    def on_refresh(self, *_):
+        page = self.stack.get_visible_child()
+        if page:
+            page.read_all()
 
 
 class App(Adw.Application):
